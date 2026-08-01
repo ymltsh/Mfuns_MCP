@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+opencode.json
+# 敏感配置（含账号密码与登录 token，勿提交）
+config.json
+
+# 日志
+logs/
+
+# 系统
+.DS_Store
+Thumbs.db

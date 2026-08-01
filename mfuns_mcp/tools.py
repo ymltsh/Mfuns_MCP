@@ -1,0 +1,893 @@
+"""MCP 工具定义（12 个，中文描述，输出为 LLM 友好的纯文本）。"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+import httpx
+from mcp.server import MCPServer
+
+from .activity import activity, read_activity
+from .client import MfunsClient, MfunsError
+from .format import author_name, html_to_text, quill_to_text, text_to_quill, ts_to_str
+
+logger = logging.getLogger(__name__)
+
+# 点赞资源类型（实测：评论与动态同为 4，文档标注的 3 已废弃）
+_RESOURCE_TYPE = {"article": 0, "video": 1, "comment": 4, "feed": 4}
+_ARTICLE_TYPE = {"article": 0, "video": 1}
+_NOTIFY_TYPE = {"like": 1, "comment": 2, "mention": 3}
+_STATUS_TEXT = {
+    0: "草稿",
+    1: "已发布",
+    2: "待审核",
+    3: "锁定",
+    4: "退回修改",
+    5: "定时发布",
+}
+
+
+# ---- Activity Log 目标/动作派生（装饰器用）----
+
+def _target_article(kw: dict) -> dict:
+    return {"type": "article", "id": kw.get("article_id")}
+
+
+def _target_user(kw: dict) -> dict:
+    return {"type": "user", "id": kw.get("user_id")}
+
+
+def _target_comment_obj(kw: dict) -> dict:
+    return {"type": kw.get("target_type") or "article", "id": kw.get("target_id")}
+
+
+def _target_react_obj(kw: dict) -> dict:
+    return {"type": kw.get("resource_type") or "article", "id": kw.get("resource_id")}
+
+
+def _target_browse(kw: dict) -> dict:
+    mode = kw.get("mode") or "recommend"
+    if mode == "category" and kw.get("category_id"):
+        return {"type": "category", "id": kw["category_id"]}
+    return {"type": "feed", "id": mode}
+
+
+def _target_submission(kw: dict) -> dict:
+    target: dict = {"type": kw.get("type") or "article"}
+    if kw.get("contribute_id"):
+        target["id"] = kw["contribute_id"]
+    return target
+
+
+def _fmt_err(e: Exception) -> str:
+    if isinstance(e, MfunsError):
+        return f"错误({e.code}): {e.msg}"
+    if isinstance(e, httpx.HTTPError):
+        return f"网络错误: {e}"
+    return f"错误: {e}"
+
+
+def _ensure_list(data: Any) -> list:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        lst = data.get("list") or data.get("items")
+        if isinstance(lst, list):
+            return lst
+    return []
+
+
+def _item_line(it: dict, base_path: str) -> str:
+    aid = it.get("id") or it.get("resource_id") or ""
+    title = (it.get("title") or "无标题").strip()
+    summary = (it.get("summary") or "").strip()
+    line = (
+        f"- [{aid}] {title} | 作者: {author_name(it)}"
+        f" | 评论: {it.get('comment_count', '?')} | 赞: {it.get('like_count', '?')}"
+    )
+    if summary:
+        line += f"\n  摘要: {summary[:80]}"
+    return line + f"\n  链接: https://m.mfuns.net/{base_path}/{aid}"
+
+
+async def _comment_block(client: MfunsClient, c: dict, with_replies: bool) -> str:
+    body = html_to_text(c.get("content") or "")
+    if not body and c.get("is_delete"):
+        body = "(评论已删除)"
+    name = author_name(c)
+    line = (
+        f"- 楼层{c.get('floor_num', '?')} (评论ID {c.get('id', '?')}) {name}: {body}"
+        f" (赞 {c.get('like_count', '?')} | 回复 {c.get('reply_count', '?')}"
+        f" | {ts_to_str(c.get('created_at'))})"
+    )
+    if with_replies and (c.get("reply_count") or 0) > 0:
+        try:
+            replies = _ensure_list(
+                await client.get(
+                    "/v1/comment/reply_list", comment_id=c.get("id"), page=1, html=1
+                )
+            )[:20]
+            for r in replies:
+                line += (
+                    f"\n    └ {author_name(r)}: {html_to_text(r.get('content') or '')}"
+                    f" (赞 {r.get('like_count', '?')} | {ts_to_str(r.get('created_at'))})"
+                )
+        except Exception:
+            pass
+    return line
+
+
+def register_tools(mcp: MCPServer) -> None:
+    """注册全部 12 个 MCP 工具。"""
+    client = MfunsClient()
+
+    @mcp.tool()
+    @activity("browse", _target_browse)
+    async def mfuns_browse(
+        mode: str = "recommend",
+        category_id: int | None = None,
+        limit: int = 20,
+        content_type: str = "all",
+    ) -> str:
+        """浏览 Mfuns 社区内容流：推荐、热门、全站动态、分类帖子或最新动态。
+
+        Args:
+            mode: 内容流模式，可选: recommend=首页推荐, hot=热门榜, feed=全站动态, category=分类帖子列表, latest=最新动态（第三方聚合时间线 mfuns.wgen.top，返回 LLM 优化的 Markdown）
+            category_id: 分类 ID，mode=category 时必填（如 51=交友专区，49=站内互动），其它模式忽略
+            limit: 返回条数上限，默认 20，最大 100
+            content_type: 内容类型过滤，仅 mode=latest 有效: all=全部（默认）, feed=动态, video=视频, article=文章
+        """
+        try:
+            limit = max(1, min(limit, 100))
+            if mode == "latest":
+                if content_type not in ("all", "feed", "video", "article"):
+                    return "错误: content_type 仅支持 all / feed / video / article"
+                text = await client.get_text(
+                    "https://mfuns.wgen.top/llm/latest",
+                    {"type": content_type, "limit": limit, "format": "markdown"},
+                )
+                title = "all" if content_type == "all" else content_type
+                return f"Mfuns 最新动态（{title}，第三方聚合 mfuns.wgen.top）:\n\n{text.strip()}"
+            if mode == "recommend":
+                data = await client.get(
+                    "/v1/recommend/get",
+                    category=category_id if category_id else -1,
+                    size=limit,
+                )
+                base = "article"
+            elif mode == "hot":
+                data = await client.get("/v1/leaderboards/hot")
+                base = "article"
+            elif mode == "feed":
+                data = await client.get("/v1/feeds/list", start_id=0)
+                base = "feed"
+            elif mode == "category":
+                if not category_id:
+                    return "错误: mode=category 时需提供 category_id"
+                data = await client.get(
+                    "/v1/category/list", cid=category_id, page=1, size=limit
+                )
+                base = "article"
+            else:
+                return "错误: mode 仅支持 recommend / hot / feed / category / latest"
+            items = _ensure_list(data)[:limit]
+            if not items:
+                return "没有找到内容"
+            lines = [f"Mfuns 内容流（{mode}，显示 {len(items)} 条）:"]
+            lines.extend(_item_line(it, base) for it in items)
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("read", _target_article)
+    async def mfuns_read_thread(
+        article_id: int,
+        comment_depth: int = 1,
+        comment_limit: int = 30,
+    ) -> str:
+        """读取帖子详情与评论区（最常用的读取工具，回复前必读）。
+
+        Args:
+            article_id: 文章 ID
+            comment_depth: 评论层级，1=只看一楼评论（默认），2=一楼评论加回复
+            comment_limit: 返回的评论条数上限，默认 30
+        """
+        try:
+            data = await client.get("/v1/article/get", id=article_id, html=1)
+            if not isinstance(data, dict) or not data.get("article"):
+                return "错误: 文章不存在或无法访问"
+            art = data["article"]
+            title = art.get("title") or "无标题"
+            body = html_to_text(art.get("content") or "")
+            cat = ""
+            if isinstance(data.get("category"), dict):
+                cat = data["category"].get("name") or ""
+            elif data.get("category"):
+                cat = str(data["category"])
+            tags = data.get("tag") or data.get("tags") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            like = ""
+            if isinstance(data.get("like_status"), dict):
+                like = (data["like_status"].get("like") or {}).get("count", "?")
+            else:
+                like = "?"
+            lines = [
+                f"标题: {title}",
+                f"作者: {author_name(data)} | 发布时间: {ts_to_str(art.get('created_at'))}",
+                f"分类: {cat or '未知'} | 浏览: {data.get('view_count', '?')}"
+                f" | 赞: {like} | 收藏: {data.get('favorite_count', '?')}"
+                f" | 打赏: {data.get('reward_count', '?')}",
+                f"链接: https://m.mfuns.net/article/{article_id}",
+            ]
+            if tags:
+                lines.append("标签: " + "、".join(str(t) for t in tags))
+            lines.append("---正文---")
+            lines.append(body or "(无正文)")
+            area_id = art.get("comment_area_id")
+            if area_id:
+                comments = await client.get(
+                    "/v1/comment/list",
+                    area_id=area_id,
+                    page=1,
+                    order="desc",
+                    html=1,
+                )
+                clist = _ensure_list(comments)[:comment_limit]
+                lines.append(f"---评论（显示 {len(clist)} 条）---")
+                for c in clist:
+                    lines.append(await _comment_block(client, c, comment_depth >= 2))
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("read_video", lambda kw: {"type": "video", "id": kw.get("video_id")})
+    async def mfuns_read_video(
+        video_id: int,
+        comment_depth: int = 1,
+        comment_limit: int = 30,
+    ) -> str:
+        """读取视频详情与评论区。
+
+        Args:
+            video_id: 视频 ID
+            comment_depth: 评论层级，1=只看一楼评论（默认），2=一楼评论加回复
+            comment_limit: 返回的评论条数上限，默认 30
+        """
+        try:
+            data = await client.get("/v1/video/get", id=video_id, html=1)
+            if not isinstance(data, dict) or not data.get("id"):
+                return "错误: 视频不存在或无法访问"
+            title = data.get("title") or "无标题"
+            body = html_to_text(data.get("content") or "")
+            cat = ""
+            if isinstance(data.get("category"), dict):
+                cat = data["category"].get("name") or ""
+            elif data.get("category"):
+                cat = str(data["category"])
+            tags = data.get("tags") or data.get("tag") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            like = ""
+            if isinstance(data.get("like_status"), dict):
+                like = (data["like_status"].get("like") or {}).get("count", "?")
+            else:
+                like = "?"
+            dur = data.get("duration") or 0
+            comments_count = data.get("comments")
+            if isinstance(comments_count, dict):
+                comments_count = comments_count.get("floor_count", "?")
+            lines = [
+                f"标题: {title}",
+                f"作者: {author_name(data)} | 发布时间: {ts_to_str(data.get('published_at') or data.get('created_at'))}",
+                f"分类: {cat or '未知'} | 播放: {data.get('view_count', '?')}"
+                f" | 赞: {like} | 评论: {comments_count}"
+                f" | 收藏: {data.get('favorite_count', '?')} | 时长: {int(dur // 60)}分{int(dur % 60)}秒",
+                f"链接: https://m.mfuns.net/video/{video_id}",
+            ]
+            if tags:
+                lines.append("标签: " + "、".join(str(t) for t in tags))
+            vids = data.get("videos") or []
+            if isinstance(vids, list) and vids:
+                lines.append("分P: " + ", ".join(str(v.get("title") or "?") for v in vids))
+            lines.append("---简介---")
+            lines.append(body or "(无简介)")
+            area_id = data.get("comment_area_id")
+            if area_id:
+                comments = await client.get(
+                    "/v1/comment/list", area_id=area_id, page=1, order="desc", html=1
+                )
+                clist = _ensure_list(comments)[:comment_limit]
+                lines.append(f"---评论（显示 {len(clist)} 条）---")
+                for c in clist:
+                    lines.append(await _comment_block(client, c, comment_depth >= 2))
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("search", lambda kw: {"type": kw.get("type") or "resource", "id": kw.get("query")})
+    async def mfuns_search(query: str, type: str = "resource", size: int = 20) -> str:
+        """搜索 Mfuns 社区的内容（文章/视频）或用户。
+
+        Args:
+            query: 搜索关键词
+            type: 搜索类型，可选: resource=内容（默认）, user=用户
+            size: 返回条数上限，默认 20，最大 50
+        """
+        try:
+            size = max(1, min(size, 50))
+            if type == "user":
+                data = await client.get("/v1/search/user", user=query, size=size)
+                users = _ensure_list(data)
+                if not users:
+                    return f"没有找到用户: {query}"
+                lines = [
+                    f"用户搜索结果（共 {data.get('total', len(users))} 个，显示 {len(users)} 条）:"
+                ]
+                for u in users:
+                    lines.append(
+                        f"- [{u.get('id')}] {u.get('name')} | 粉丝: {u.get('fans', '?')}"
+                        f" | 简介: {(u.get('info') or u.get('bio') or '')[:60]}"
+                    )
+                return "\n".join(lines)
+            try:
+                data = await client.get(
+                    "/v1/search/resource",
+                    text=query,
+                    type=-1,
+                    page=1,
+                    size=size,
+                    sort="all",
+                )
+            except MfunsError as e:
+                if e.code in (401, 4031):
+                    return (
+                        f"错误({e.code}): {e.msg}（内容搜索需要登录，"
+                        "请配置 MFUNS_ACCOUNT / MFUNS_PASSWORD 环境变量或 config.json 账号）"
+                    )
+                raise
+            items = _ensure_list(data)
+            if not items:
+                return f"没有找到相关内容: {query}"
+            lines = [
+                f"内容搜索结果（共 {data.get('total', len(items))} 个，显示 {len(items)} 条）:"
+            ]
+            for it in items:
+                base = "video" if it.get("type") == 1 else "article"
+                lines.append(_item_line(it, base))
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("get_user", _target_user)
+    async def mfuns_get_user(user_id: int) -> str:
+        """获取用户资料（互动前了解对象：判断是新人还是老用户）。
+
+        Args:
+            user_id: 用户 ID
+        """
+        try:
+            data = await client.get("/v1/user/get_user", id=user_id)
+            if not isinstance(data, dict):
+                return "错误: 未找到该用户"
+            gender = {0: "未知", 1: "男", 2: "女"}.get(data.get("gender"), data.get("gender") or "未知")
+            badges = data.get("badges")
+            lines = [
+                f"用户: {data.get('name') or f'用户{user_id}'} (ID {user_id})",
+                f"简介: {data.get('bio') or '(无)'}",
+                f"性别: {gender} | 累计被赞: {data.get('total_likes_count', '?')}"
+                f" | 累计浏览: {data.get('total_views_count', '?')}",
+                f"加入时间: {ts_to_str(data.get('created_at'))}",
+            ]
+            if isinstance(badges, list) and badges:
+                lines.append(
+                    "徽章: " + ", ".join(str(b if isinstance(b, int) else b.get("name", b)) for b in badges)
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity(
+        lambda kw: "create" if kw.get("target_type") != "comment" else "create_reply",
+        _target_comment_obj,
+    )
+    async def mfuns_comment(target_type: str, target_id: int, content: str) -> str:
+        """发表评论或回复评论（内容为纯文本，自动转换为论坛格式）。
+
+        Args:
+            target_type: 评论对象，可选: article=评论帖子, video=评论视频, comment=回复评论
+            target_id: 文章/视频 ID（target_type=article/video）或评论 ID（target_type=comment）
+            content: 评论/回复内容
+        """
+        try:
+            if not content.strip():
+                return "错误: 内容不能为空"
+            quill = text_to_quill(content)
+            if target_type in ("article", "video"):
+                area_id = (
+                    await client.article_area_id(target_id)
+                    if target_type == "article"
+                    else await client.video_area_id(target_id)
+                )
+                data = await client.post(
+                    "/v1/comment/create",
+                    json_body={"area_id": area_id, "content": quill, "html": 1},
+                )
+                floor = data.get("floor_num") if isinstance(data, dict) else None
+                return f"评论成功（{target_type} {target_id}，楼层 {floor or '?'}）"
+            if target_type == "comment":
+                await client.post(
+                    "/v1/comment/create_reply",
+                    json_body={"comment_id": target_id, "content": quill},
+                )
+                return f"回复成功（评论 {target_id}）"
+            return "错误: target_type 仅支持 article / video / comment"
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("create_post", lambda kw: {"type": "post"})
+    async def mfuns_create_post(
+        title: str,
+        content: str,
+        category_id: int,
+        tags: list[str] | None = None,
+        copyright: int = 2,
+        cover: str | None = None,
+        draft: bool = False,
+    ) -> str:
+        """发布文章帖子（纯文本或 Markdown 正文，服务端自动转换）。
+
+        Args:
+            title: 标题（最长 30 字）
+            content: 正文，支持纯文本或 Markdown
+            category_id: 分类 ID（如 51=交友专区，49=站内互动）
+            tags: 标签列表，最多 10 个
+            copyright: 版权，2=原创（默认），1=转载，0=其他
+            cover: 封面图 https 外链（可选）
+            draft: 是否只存草稿，默认 False 直接投稿
+        """
+        try:
+            payload: dict = {
+                "cid": category_id,
+                "title": title,
+                "content": content,
+                "content_format": "markdown",
+                "copyright": copyright,
+                "draft": draft,
+            }
+            if tags:
+                payload["tags"] = ",".join(tags[:10])
+            if cover:
+                payload["cover"] = cover
+            data = await client.post("/v1/contribute/article/create", json_body=payload)
+            con = (data or {}).get("contribute") or {}
+            msg = f"投稿成功: 投稿ID {con.get('id', '?')}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}"
+            if con.get("resource_id"):
+                msg += f"，链接: https://m.mfuns.net/article/{con['resource_id']}"
+            return msg
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("create_feed", lambda kw: {"type": "feed"})
+    async def mfuns_create_feed(
+        content: str,
+        images: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> str:
+        """发布动态（Feed，全站动态流可见）。
+
+        Args:
+            content: 动态内容（纯文本，自动转换为论坛格式）
+            images: 图片 URL 列表（可选）
+            tags: 标签列表（可选，最多 10 个）
+        """
+        try:
+            if not content.strip():
+                return "错误: 内容不能为空"
+            payload: dict = {
+                "content": text_to_quill(content),
+                "images": json.dumps(images or [], ensure_ascii=False),
+            }
+            if tags:
+                payload["tags"] = ",".join(tags[:10])
+            data = await client.post("/v1/feeds/create", json_body=payload)
+            fid = data.get("id") if isinstance(data, dict) else None
+            return f"动态发布成功（feed ID {fid or '?'}）"
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity(
+        lambda kw: f"delete_{kw.get('target_type')}",
+        lambda kw: {"type": kw.get("target_type"), "id": kw.get("target_id")},
+    )
+    async def mfuns_delete(target_type: str, target_id: int) -> str:
+        """删除内容（动态或评论，仅限本人内容）。
+
+        Args:
+            target_type: 删除对象，可选: feed=动态, comment=评论
+            target_id: 对象 ID（动态 ID / 评论 ID）
+        """
+        try:
+            if target_type == "feed":
+                await client.post("/v1/feeds/delete", json_body={"id": target_id})
+                return f"已删除动态 {target_id}"
+            if target_type == "comment":
+                await client.post(
+                    "/v1/comment/delete", json_body={"comment_id": target_id}
+                )
+                return f"已删除评论 {target_id}"
+            return "错误: target_type 仅支持 feed / comment"
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity(
+        lambda kw: f"message_{kw.get('action') or 'list'}",
+        lambda kw: {"type": "message", "id": kw.get("user_id") or "list"},
+    )
+    async def mfuns_messages(action: str = "list", user_id: int | None = None) -> str:
+        """查看私信会话列表或与某用户的聊天记录。
+
+        Args:
+            action: 操作，可选: list=会话列表（默认）, read=读取聊天记录
+            user_id: 对方用户 ID（action=read 时必填）
+        """
+        try:
+            if action == "read":
+                if not user_id:
+                    return "错误: action=read 需提供 user_id"
+                data = await client.get("/v1/message/record", uid=user_id)
+                items = _ensure_list(data)
+                me = await client.get("/v1/user/info")
+                my_name = ((me or {}).get("user") or {}).get("name") or "我"
+                peer = await client.get("/v1/user/get_user", id=user_id)
+                peer_name = peer.get("name") if isinstance(peer, dict) else str(user_id)
+                if not items:
+                    return f"与 {peer_name} 暂无私信记录"
+                lines = [f"与 {peer_name} 的私信记录（{len(items)} 条）:"]
+                for it in items:
+                    d = it.get("data") or {}
+                    msg = quill_to_text(d.get("message") or "")
+                    who = my_name if it.get("uid") == (me or {}).get("user", {}).get("id") else peer_name
+                    lines.append(f"- {ts_to_str(d.get('time'))} {who}: {msg}")
+                return "\n".join(lines)
+            data = await client.get("/v1/message/list")
+            convs = _ensure_list(data)
+            if not convs:
+                return "暂无私信会话"
+            lines = [f"私信会话（{len(convs)} 个）:"]
+            for c in convs:
+                u = c.get("user") or {}
+                last = (c.get("last_msg") or {}).get("data") or {}
+                msg = quill_to_text(last.get("message") or "")
+                lines.append(
+                    f"- [{u.get('id', '?')}] {u.get('name', '未知')}"
+                    f" | 未读 {c.get('no_read', 0)}"
+                    f" | 最近({ts_to_str(last.get('time'))}): {msg}"
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity(lambda kw: kw.get("action") or "like", _target_react_obj)
+    async def mfuns_react(
+        resource_type: str, resource_id: int, action: str = "like"
+    ) -> str:
+        """对内容点赞 / 取消点赞 / 点踩。
+
+        Args:
+            resource_type: 资源类型，可选: article=文章, video=视频, comment=评论, feed=动态
+            resource_id: 资源 ID
+            action: 操作，可选: like=点赞（默认）, cancel=取消点赞, dislike=点踩
+        """
+        try:
+            rtype = _RESOURCE_TYPE.get(resource_type)
+            if rtype is None:
+                return "错误: resource_type 仅支持 article / video / comment / feed"
+            if action not in ("like", "cancel", "dislike"):
+                return "错误: action 仅支持 like / cancel / dislike"
+            await client.post(
+                f"/v1/like/{action}", json_body={"id": resource_id, "type": rtype}
+            )
+            verb = {"like": "点赞", "cancel": "取消点赞", "dislike": "点踩"}[action]
+            return f"已{verb}（{resource_type} {resource_id}）"
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity(lambda kw: f"favorite_{kw.get('action') or 'add'}", _target_react_obj)
+    async def mfuns_favorite(
+        resource_id: int,
+        resource_type: str = "article",
+        action: str = "add",
+        list_id: int | None = None,
+    ) -> str:
+        """收藏 / 取消收藏 / 查询收藏状态。
+
+        Args:
+            resource_id: 资源 ID
+            resource_type: 资源类型，可选: article=文章, video=视频
+            action: 操作，可选: add=收藏（默认）, remove=取消收藏, check=查询是否已收藏
+            list_id: 收藏夹 ID；add 时不传则使用默认收藏夹，remove 时必填
+        """
+        try:
+            rtype = _ARTICLE_TYPE.get(resource_type)
+            if rtype is None:
+                return "错误: resource_type 仅支持 article / video"
+            if action == "check":
+                data = await client.get(
+                    "/v1/favorite/is_favorite",
+                    resource_id=resource_id,
+                    resource_type=rtype,
+                )
+                state = "已收藏" if (data or {}).get("is_favorite") else "未收藏"
+                return f"{resource_type} {resource_id}: {state}（收藏数 {data.get('count', '?')}）"
+            if action == "add":
+                lid = list_id or await client.default_favorite_list_id()
+                await client.post(
+                    "/v1/favorite/add_favorite",
+                    json_body={
+                        "list_id": lid,
+                        "resource_id": resource_id,
+                        "type": rtype,
+                    },
+                )
+                return f"收藏成功（{resource_type} {resource_id} -> 收藏夹 {lid}）"
+            if action == "remove":
+                if not list_id:
+                    return "错误: remove 需提供 list_id"
+                await client.post(
+                    "/v1/favorite/remove_favorite_by_resource",
+                    json_body={
+                        "resource_id": resource_id,
+                        "list_id": list_id,
+                        "type": rtype,
+                    },
+                )
+                return f"已取消收藏（{resource_type} {resource_id}）"
+            return "错误: action 仅支持 add / remove / check"
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("notify", lambda kw: {"type": "notification", "id": kw.get("type")})
+    async def mfuns_notifications(type: str = "comment", page: int = 1) -> str:
+        """获取通知消息（收到的赞/评论/提及）与未读计数。
+
+        Args:
+            type: 通知类型，可选: like=收到的赞, comment=收到的评论/回复（默认）, mention=@提及
+            page: 页码，默认 1
+        """
+        try:
+            ntype = _NOTIFY_TYPE.get(type)
+            if ntype is None:
+                return "错误: type 仅支持 like / comment / mention"
+            counts = (await client.get("/v1/notify/count")) or {}
+            data = await client.get("/v1/notify/get", type=ntype, page=page)
+            items = _ensure_list(data)
+            lines = [
+                f"未读: 赞 {counts.get('like', 0)} | 评论 {counts.get('comment', 0)}"
+                f" | 提及 {counts.get('mention', 0)} | 系统 {counts.get('system', 0)}"
+            ]
+            if not items:
+                lines.append("暂无此类通知")
+            for n in items:
+                p = n.get("notify_params") or {}
+                text = p.get("text") or p.get("reply_text") or ""
+                cid = p.get("comment_id")
+                extra = f"（评论ID {cid}）" if cid is not None else ""
+                lines.append(
+                    f"- 用户{n.get('sender_user_id', '?')} | {ts_to_str(n.get('created_at'))}:"
+                    f" {text}{extra}"
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("history", lambda kw: {"type": "history", "id": kw.get("resource_type") or "all"})
+    async def mfuns_history(
+        resource_type: str | None = None, limit: int = 50
+    ) -> str:
+        """获取浏览历史（了解自己看过什么，避免重复互动）。
+
+        Args:
+            resource_type: 过滤资源类型，可选: article=文章, video=视频；不传返回全部
+            limit: 返回条数上限，默认 50
+        """
+        try:
+            params: dict = {}
+            if resource_type:
+                rt = _ARTICLE_TYPE.get(resource_type)
+                if rt is None:
+                    return "错误: resource_type 仅支持 article / video"
+                params["resource_type"] = rt
+            data = await client.get("/v1/history/get", **params)
+            items = _ensure_list(data)[:limit]
+            if not items:
+                return "暂无浏览历史"
+            lines = [f"浏览历史（显示 {len(items)} 条）:"]
+            for it in items:
+                info = it.get("resource_info") or {}
+                t = ts_to_str(it.get("created_at"))
+                lines.append(
+                    f"- [{info.get('id', '?')}] {info.get('title', '无标题')}"
+                    f" | 作者: {author_name(info)}" + (f" | 浏览时间: {t}" if t else "")
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("publish_video", lambda kw: {"type": "video"})
+    async def mfuns_publish_video(
+        title: str,
+        video_url: str,
+        content: str = "",
+        category_id: int = 1,
+        cover: str | None = None,
+        copyright: int = 0,
+        tags: list[str] | None = None,
+    ) -> str:
+        """外链视频投稿（视频直链 URL，如复活失效的 B 站外链视频；不含本地上传）。
+
+        Args:
+            title: 标题（最长 30 字）
+            video_url: 视频直链 URL（https）
+            content: 简介（纯文本）
+            category_id: 分类 ID，默认 1
+            cover: 封面图 https 外链（可选）
+            copyright: 版权，0=其他（默认，适合转载），1=转载，2=原创
+            tags: 标签列表，最多 10 个
+        """
+        try:
+            payload: dict = {
+                "cid": category_id,
+                "title": title,
+                "content": text_to_quill(content or ""),
+                "video": json.dumps(
+                    [{"type": "link", "content": video_url, "title": title}],
+                    ensure_ascii=False,
+                ),
+                "copyright": copyright,
+            }
+            if tags:
+                payload["tags"] = ",".join(tags[:10])
+            if cover:
+                payload["cover"] = cover
+            data = await client.post("/v1/contribute/video/create", json_body=payload)
+            con = (data or {}).get("contribute") or {}
+            return f"视频投稿成功: 投稿ID {con.get('id', '?')}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}"
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity(lambda kw: kw.get("action") or "list", _target_submission)
+    async def mfuns_manage_submission(
+        type: str = "article",
+        action: str = "list",
+        contribute_id: int | None = None,
+        page: int = 1,
+        size: int = 20,
+        status: int | None = None,
+        title: str | None = None,
+        content: str | None = None,
+        category_id: int | None = None,
+        tags: list[str] | None = None,
+        cover: str | None = None,
+        draft: bool | None = None,
+    ) -> str:
+        """管理我的投稿：查看列表 / 更新文章投稿 / 删除文章投稿。
+
+        Args:
+            type: 稿件类型，可选: article=文章, video=视频
+            action: 操作，可选: list=列表（默认）, update=更新, delete=删除
+            contribute_id: 投稿 ID（update/delete 必填）
+            page: 页码，默认 1
+            size: 每页数量，默认 20，最大 100
+            status: 状态过滤（list 可选）: 0草稿 1已发布 2待审核 3锁定 4退回修改 5定时发布
+            title: 新标题（update 必填）
+            content: 新正文（update 必填，纯文本或 Markdown）
+            category_id: 新分类 ID（update 必填）
+            tags: 新标签（update 可选）
+            cover: 新封面（update 可选）
+            draft: 更新后是否保持草稿（update 可选，不传则进入审核队列；草稿稿件更新建议传 true）
+        """
+        try:
+            atype = _ARTICLE_TYPE.get(type)
+            if atype is None:
+                return "错误: type 仅支持 article / video"
+            if action == "list":
+                params: dict = {"type": atype, "page": page, "size": min(size, 100)}
+                if status is not None:
+                    params["status"] = status
+                data = await client.get("/v1/contribute/list", **params)
+                items = _ensure_list(data)
+                if not items:
+                    return "暂无投稿"
+                lines = [
+                    f"我的投稿（{type}，共 {data.get('total', len(items))} 条，显示 {len(items)} 条）:"
+                ]
+                for it in items:
+                    lines.append(
+                        f"- 投稿ID {it.get('id')} | 资源ID {it.get('resource_id') or '-'}"
+                        f" | {it.get('title')} | 状态: {_STATUS_TEXT.get(it.get('status'), it.get('status'))}"
+                        f" | 创建: {ts_to_str(it.get('created_at'))}"
+                    )
+                return "\n".join(lines)
+            if action == "update":
+                if type != "article":
+                    return "错误: v0.1 仅支持更新文章投稿（视频更新需完整视频数据）"
+                if not contribute_id or not title or content is None or not category_id:
+                    return "错误: update 需提供 contribute_id / title / content / category_id"
+                payload: dict = {
+                    "contribute_id": contribute_id,
+                    "cid": category_id,
+                    "title": title,
+                    "content": content,
+                    "content_format": "markdown",
+                    "copyright": 2,
+                }
+                if tags:
+                    payload["tags"] = ",".join(tags[:10])
+                if cover:
+                    payload["cover"] = cover
+                if draft is not None:
+                    payload["draft"] = draft
+                data = await client.post(
+                    "/v1/contribute/article/update", json_body=payload
+                )
+                con = (data or {}).get("contribute") or {}
+                return f"更新成功: 投稿ID {con.get('id', contribute_id)}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}"
+            if action == "delete":
+                if type != "article":
+                    return "错误: v0.1 仅支持删除文章投稿"
+                if not contribute_id:
+                    return "错误: delete 需提供 contribute_id"
+                await client.post(
+                    "/v1/contribute/article/delete",
+                    json_body={"contribute_id": contribute_id},
+                )
+                return f"已删除投稿 {contribute_id}"
+            return "错误: action 仅支持 list / update / delete"
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("query", lambda kw: {"type": "activity", "id": kw.get("date")})
+    async def mfuns_activity_log(
+        date: str,
+        tool: str | None = None,
+        target_id: int | None = None,
+    ) -> str:
+        """查询 Activity Log（每次工具调用的操作记录，按日期隔离的 JSON 文件）。
+
+        Args:
+            date: 日期，格式 YYYY-MM-DD（如 2026-08-02）
+            tool: 可选，按工具名过滤（如 mfuns_comment）
+            target_id: 可选，按影响对象 ID 过滤（如帖子/评论 ID 83888）
+        """
+        try:
+            logs = read_activity(date)
+            if tool:
+                logs = [x for x in logs if x.get("tool") == tool]
+            if target_id is not None:
+                logs = [x for x in logs if (x.get("target") or {}).get("id") == target_id]
+            if not logs:
+                return f"{date} 无匹配的 Activity Log"
+            lines = [f"Activity Log（{date}，共 {len(logs)} 条）:"]
+            lines.extend(f"- {x.get('time')} {x.get('tool')} | {x.get('action')}" for x in logs)
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
