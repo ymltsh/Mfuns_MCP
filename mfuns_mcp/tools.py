@@ -61,6 +61,48 @@ def _target_submission(kw: dict) -> dict:
     return target
 
 
+async def _resolve_category(client: MfunsClient, category_id: int | None) -> tuple[int, str | None]:
+    """解析投稿分区：父级分区自动落到第一个叶子子分区。
+
+    Returns:
+        (解析后的叶子分区 ID, 分区名)；category_id 缺省时抛 MfunsError（内联可投稿分区提示）。
+    """
+    data = await client.get("/v1/category/all")
+    cats = data if isinstance(data, list) else (data or {}).get("list") or []
+
+    def find(items, cid):
+        for c in items or []:
+            if c.get("id") == cid:
+                return c
+            r = find(c.get("children"), cid)
+            if r:
+                return r
+        return None
+
+    def first_leaf(c: dict):
+        children = c.get("children") or []
+        if not children:
+            return c
+        return first_leaf(children[0])
+
+    if category_id is None:
+        tops = [c.get("name") for c in cats if isinstance(c, dict) and c.get("name")]
+        raise MfunsError(
+            -1,
+            "请指定 category_id（可投稿的叶子分区；顶级分区有: "
+            + "、".join(str(t) for t in tops)
+            + "，可用 mfuns_categories 查看完整分区树）",
+        )
+    cat = find(cats, category_id)
+    if not cat:
+        raise MfunsError(-1, f"分类 {category_id} 不存在（可用 mfuns_categories 查看分区树）")
+    leaf = first_leaf(cat)
+    resolved = int(leaf.get("id"))
+    if resolved != category_id:
+        return resolved, f"{cat.get('name')}为父级分区，已自动选择叶子分区「{leaf.get('name')}」({resolved})"
+    return resolved, None
+
+
 def _fmt_err(e: Exception) -> str:
     if isinstance(e, MfunsError):
         return f"错误({e.code}): {e.msg}"
@@ -310,6 +352,57 @@ def register_tools(mcp: MCPServer) -> None:
             return _fmt_err(e)
 
     @mcp.tool()
+    @activity("read_feed", lambda kw: {"type": "feed", "id": kw.get("feed_id")})
+    async def mfuns_read_feed(
+        feed_id: int,
+        comment_depth: int = 1,
+        comment_limit: int = 30,
+    ) -> str:
+        """读取动态详情与评论区。
+
+        Args:
+            feed_id: 动态 ID
+            comment_depth: 评论层级，1=只看一楼评论（默认），2=一楼评论加回复
+            comment_limit: 返回的评论条数上限，默认 30
+        """
+        try:
+            data = await client.get("/v1/feeds/get", id=feed_id, html=1)
+            if not isinstance(data, dict) or not data.get("id"):
+                return "错误: 动态不存在或无法访问"
+            body = html_to_text(data.get("content") or "")
+            tags = data.get("tags") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            like = ""
+            if isinstance(data.get("like_status"), dict):
+                like = (data["like_status"].get("like") or {}).get("count", "?")
+            else:
+                like = "?"
+            lines = [
+                f"动态 #{feed_id}",
+                f"作者: {author_name(data)} | 发布: {ts_to_str(data.get('created_at'))}"
+                f" | 阅读: {data.get('views', '?')} | 赞: {like}"
+                f" | 评论: {data.get('floor_count', '?')}",
+                f"链接: https://m.mfuns.net/feed/{feed_id}",
+            ]
+            if tags:
+                lines.append("标签: " + "、".join(str(t) for t in tags))
+            lines.append("---内容---")
+            lines.append(body or "(无内容)")
+            area_id = data.get("comment_area_id")
+            if area_id:
+                comments = await client.get(
+                    "/v1/comment/list", area_id=area_id, page=1, order="desc", html=1
+                )
+                clist = _ensure_list(comments)[:comment_limit]
+                lines.append(f"---评论（显示 {len(clist)} 条）---")
+                for c in clist:
+                    lines.append(await _comment_block(client, c, comment_depth >= 2))
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
     @activity("search", lambda kw: {"type": kw.get("type") or "resource", "id": kw.get("query")})
     async def mfuns_search(query: str, type: str = "resource", size: int = 20) -> str:
         """搜索 Mfuns 社区的内容（文章/视频）或用户。
@@ -402,20 +495,21 @@ def register_tools(mcp: MCPServer) -> None:
         """发表评论或回复评论（内容为纯文本，自动转换为论坛格式）。
 
         Args:
-            target_type: 评论对象，可选: article=评论帖子, video=评论视频, comment=回复评论
-            target_id: 文章/视频 ID（target_type=article/video）或评论 ID（target_type=comment）
+            target_type: 评论对象，可选: article=评论帖子, video=评论视频, feed=评论动态, comment=回复评论
+            target_id: 文章/视频/动态 ID（target_type=article/video/feed）或评论 ID（target_type=comment）
             content: 评论/回复内容
         """
         try:
             if not content.strip():
                 return "错误: 内容不能为空"
             quill = text_to_quill(content)
-            if target_type in ("article", "video"):
-                area_id = (
-                    await client.article_area_id(target_id)
-                    if target_type == "article"
-                    else await client.video_area_id(target_id)
-                )
+            if target_type in ("article", "video", "feed"):
+                if target_type == "article":
+                    area_id = await client.article_area_id(target_id)
+                elif target_type == "video":
+                    area_id = await client.video_area_id(target_id)
+                else:
+                    area_id = await client.feed_area_id(target_id)
                 data = await client.post(
                     "/v1/comment/create",
                     json_body={"area_id": area_id, "content": quill, "html": 1},
@@ -428,7 +522,42 @@ def register_tools(mcp: MCPServer) -> None:
                     json_body={"comment_id": target_id, "content": quill},
                 )
                 return f"回复成功（评论 {target_id}）"
-            return "错误: target_type 仅支持 article / video / comment"
+            return "错误: target_type 仅支持 article / video / feed / comment"
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("categories", lambda kw: {"type": "category"})
+    async def mfuns_categories() -> str:
+        """查询投稿分区树（发布帖子/视频前用 mfuns_categories 选 category_id）。
+
+        Args:
+            无参数：返回完整分区树，叶子分区可投稿，父级分区仅作导航
+        """
+        try:
+            data = await client.get("/v1/category/all")
+            cats = data
+            if isinstance(cats, dict):
+                cats = cats.get("list") or cats.get("children") or []
+            if not cats:
+                return "暂无分区数据"
+            lines = ["投稿分区（叶子分区可投稿，父级分区不可直接投稿）:"]
+
+            def walk(items, parent_name: str, depth: int) -> None:
+                for c in items or []:
+                    if not isinstance(c, dict):
+                        continue
+                    name = c.get("name") or "?"
+                    children = c.get("children") or []
+                    mark = "可投稿" if not children else "父级分区"
+                    lines.append(
+                        f"{'  ' * depth}[{c.get('id')}] {name}"
+                        f"（{parent_name or '顶级'}） - {mark}"
+                    )
+                    walk(children, name, depth + 1)
+
+            walk(cats, "", 0)
+            return "\n".join(lines)
         except Exception as e:
             return _fmt_err(e)
 
@@ -437,7 +566,7 @@ def register_tools(mcp: MCPServer) -> None:
     async def mfuns_create_post(
         title: str,
         content: str,
-        category_id: int,
+        category_id: int | None = None,
         tags: list[str] | None = None,
         copyright: int = 2,
         cover: str | None = None,
@@ -448,15 +577,16 @@ def register_tools(mcp: MCPServer) -> None:
         Args:
             title: 标题（最长 30 字）
             content: 正文，支持纯文本或 Markdown
-            category_id: 分类 ID（如 51=交友专区，49=站内互动）
+            category_id: 分类 ID（须为叶子分区；传父级分区会自动落到其第一个叶子子分区，缺省则返回可投稿分区提示；如 44=科技综合，51=交友专区）
             tags: 标签列表，最多 10 个
             copyright: 版权，2=原创（默认），1=转载，0=其他
             cover: 封面图 https 外链（可选）
             draft: 是否只存草稿，默认 False 直接投稿
         """
         try:
+            cid, note = await _resolve_category(client, category_id)
             payload: dict = {
-                "cid": category_id,
+                "cid": cid,
                 "title": title,
                 "content": content,
                 "content_format": "markdown",
@@ -470,9 +600,15 @@ def register_tools(mcp: MCPServer) -> None:
             data = await client.post("/v1/contribute/article/create", json_body=payload)
             con = (data or {}).get("contribute") or {}
             msg = f"投稿成功: 投稿ID {con.get('id', '?')}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}"
+            if note:
+                msg += f"\n提示: {note}"
             if con.get("resource_id"):
                 msg += f"，链接: https://m.mfuns.net/article/{con['resource_id']}"
             return msg
+        except MfunsError as e:
+            if "分区" in e.msg:
+                return f"错误({e.code}): {e.msg}"
+            return _fmt_err(e)
         except Exception as e:
             return _fmt_err(e)
 
@@ -735,7 +871,7 @@ def register_tools(mcp: MCPServer) -> None:
         title: str,
         video_url: str,
         content: str = "",
-        category_id: int = 1,
+        category_id: int | None = None,
         cover: str | None = None,
         copyright: int = 0,
         tags: list[str] | None = None,
@@ -746,14 +882,15 @@ def register_tools(mcp: MCPServer) -> None:
             title: 标题（最长 30 字）
             video_url: 视频直链 URL（https）
             content: 简介（纯文本）
-            category_id: 分类 ID，默认 1
+            category_id: 分类 ID（须为叶子分区；传父级分区会自动落到其第一个叶子子分区，缺省默认 1 动画>MMD.3D 请显式指定；如 20=游戏综合）
             cover: 封面图 https 外链（可选）
             copyright: 版权，0=其他（默认，适合转载），1=转载，2=原创
             tags: 标签列表，最多 10 个
         """
         try:
+            cid, note = await _resolve_category(client, category_id)
             payload: dict = {
-                "cid": category_id,
+                "cid": cid,
                 "title": title,
                 "content": text_to_quill(content or ""),
                 "video": json.dumps(
@@ -768,7 +905,14 @@ def register_tools(mcp: MCPServer) -> None:
                 payload["cover"] = cover
             data = await client.post("/v1/contribute/video/create", json_body=payload)
             con = (data or {}).get("contribute") or {}
-            return f"视频投稿成功: 投稿ID {con.get('id', '?')}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}"
+            msg = f"视频投稿成功: 投稿ID {con.get('id', '?')}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}"
+            if note:
+                msg += f"\n提示: {note}"
+            return msg
+        except MfunsError as e:
+            if "分区" in e.msg:
+                return f"错误({e.code}): {e.msg}"
+            return _fmt_err(e)
         except Exception as e:
             return _fmt_err(e)
 

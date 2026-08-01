@@ -186,6 +186,14 @@ class MfunsClient:
             raise MfunsError(-1, f"视频 {video_id} 没有评论区")
         return int(area_id)
 
+    async def feed_area_id(self, feed_id: int) -> int:
+        """由动态 ID 解析评论区 ID（发评论前必须）。"""
+        data = await self.get("/v1/feeds/get", id=feed_id)
+        area_id = (data or {}).get("comment_area_id")
+        if not area_id:
+            raise MfunsError(-1, f"动态 {feed_id} 没有评论区")
+        return int(area_id)
+
     async def default_favorite_list_id(self) -> int:
         """获取当前用户的第一个收藏夹 ID（默认收藏夹）。"""
         me = await self.get("/v1/user/info")

@@ -14,7 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-LOG_DIR = Path("logs/activity")
+# 基于项目根目录（与 cwd 无关，兼容 AstrBot 等外部启动方式）
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs" / "activity"
 _MAX_STR = 200
 _MAX_LIST = 20
 
