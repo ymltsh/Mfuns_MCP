@@ -50,7 +50,11 @@
 
 | 工具 | 说明 |
 | ---- | ---- |
-| `mfuns_activity_log` | 查询 Activity Log（每次工具调用的操作记录，按日期隔离） |
+| `mfuns_account_modify` | 添加/移除账号（添加支持账密 / Token 导入 / API Key 绑定，自动校验与查重；移除自动回退当前账号） |
+| `mfuns_account_list` | 查看账号组（active 标记当前身份） |
+| `mfuns_account_current` | 查看当前操作身份（发布前确认） |
+| `mfuns_account_switch` | 切换当前账号（校验身份防串号，失败自动回滚） |
+| `mfuns_activity_log` | 查询 Activity Log（按账号与日期隔离，支持指定账号） |
 
 ---
 
@@ -62,9 +66,9 @@
 uv sync
 ```
 
-### 2. 配置凭据
+### 2. 配置凭据（多账号组）
 
-复制配置模板并填入账号密码（或使用环境变量）：
+复制配置模板并填入账号：
 
 ```bash
 Copy-Item config.json.example config.json
@@ -73,21 +77,28 @@ Copy-Item config.json.example config.json
 ```json
 {
   "base_url": "https://api.mfuns.net",
-  "account": "你的手机号/用户名",
-  "password": "你的密码",
-  "token": "",
-  "user_id": null
+  "accounts": [
+    {
+      "id": "u_38461",
+      "profile": { "user_id": 38461, "user_name": "Sincerely" },
+      "auth": {
+        "account": "手机号/用户名",
+        "password": "密码",
+        "token": "登录 token（可选，留空自动登录）",
+        "api_key": "官方开放平台密钥 mf_xxx（可选，仅投稿接口用）"
+      },
+      "enabled": true
+    }
+  ],
+  "runtime": { "current_account": "u_38461" }
 }
 ```
 
-或者环境变量（优先级更高）：
-
-```bash
-$env:MFUNS_ACCOUNT = "你的账号"
-$env:MFUNS_PASSWORD = "你的密码"
-```
-
-首次调用写操作时自动登录，token 缓存回 `config.json`（约 25 天有效，失效自动重登）。未配置凭据时读操作（浏览/读帖/搜索）可匿名使用。
+- `accounts` 支持多账号共存，每个账号独立的 token / api_key / 登录凭据 / Activity Log
+- 未登录账号可用临时 id（如 `u_unknown_1`），首次登录后自动更新为 `u_<user_id>` 并填充 profile
+- 身份切换：`mfuns_account_list` 查看、`mfuns_account_switch` 切换（切换时校验 token 与账号 user_id 一致，防串号）、`mfuns_account_current` 确认身份
+- 业务工具自动使用当前账号，无需传账号参数；切换失败自动回滚原账号
+- 首次业务调用自动登录，token 回写 config.json（约 25 天有效，失效自动重登）
 
 ### 3. 启动
 
@@ -134,12 +145,15 @@ uv run main.py --transport sse                # SSE
 
 ## Activity Log
 
-每次 MCP 工具调用自动记录一条操作日志，按日期隔离为 JSON 文件，不参与 Agent 默认上下文：
+每次 MCP 工具调用自动记录一条操作日志，按**账号与日期**隔离为 JSON 文件，不参与 Agent 默认上下文：
 
 ```text
 logs/activity/
-├── 2026-08-02.json
-└── ...
+├── u_38461/
+│   ├── 2026-08-02.json
+│   └── 2026-08-03.json
+└── u_17627/
+    └── 2026-08-03.json
 ```
 
 ```json
@@ -153,7 +167,7 @@ logs/activity/
 }
 ```
 
-通过 `mfuns_activity_log(date, tool?, target_id?)` 按日期 / 工具名 / 对象 ID 查询。不存储 LLM 思考与完整上下文；数据量大后可平滑迁移 SQLite / PostgreSQL（结构不变）。
+通过 `mfuns_activity_log(date, tool?, target_id?, account_id?)` 按日期 / 工具名 / 对象 ID / 账号查询（默认当前账号）。不存储 LLM 思考与完整上下文；数据量大后可平滑迁移 SQLite / PostgreSQL（结构不变）。
 
 ---
 

@@ -21,10 +21,8 @@ from mfuns_mcp.server import build_server
 
 def print_status(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000, path: str = "/mcp") -> None:
     """向 stderr 打印服务状态与使用说明。"""
-    account, _password = config.get_credentials()
-    token = config.get_token()
-    user_id = config.get_user_id()
-    has_token = bool(token)
+    accounts = config.get_accounts()
+    current = config.get_current_account_id()
 
     lines = [
         "================================================",
@@ -38,17 +36,15 @@ def print_status(transport: str = "stdio", host: str = "127.0.0.1", port: int = 
     lines += [
         f" 接口地址    : {config.get_base_url()}",
         f" 配置文件    : {config._CONFIG_PATH}",
-        f" 账号配置    : {'是 (' + account + ')' if account else '否'}",
-        f" 登录状态    : " + ("已登录 (user_id=" + str(user_id) + ")" if has_token else "未登录（读接口可匿名使用，写接口将自动登录）"),
+        f" 账号组      : {len(accounts)} 个（当前: {current}）",
         "------------------------------------------------",
         " 使用说明:",
         "  1. 在 MCP 客户端配置本服务（mcpServers）:",
         '     { "command": "uv", "args": ['
         f'"--directory", "{config._CONFIG_PATH.parent}", "run", "main.py"] }}',
-        "  2. 未配置账号时，浏览/搜索/读帖等读操作可直接使用;",
-        "  3. 评论/点赞/投稿等写操作需账号密码:",
-        "     环境变量 MFUNS_ACCOUNT / MFUNS_PASSWORD，或 config.json 的 account / password;",
-        "  4. 登录成功后 token 自动缓存到 config.json（约 25 天有效，失效自动重登）。",
+        "  2. 多账号通过 mfuns_account_list / mfuns_account_switch 管理身份;",
+        "  3. 未配置 token 的账号首次业务调用会自动登录（需 auth.account/password）;",
+        "  4. 登录成功后 token 回写 config.json（约 25 天有效，失效自动重登）。",
         "================================================",
     ]
     print("\n".join(lines), file=sys.stderr, flush=True)

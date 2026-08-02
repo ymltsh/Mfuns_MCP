@@ -1,4 +1,4 @@
-"""Mfuns API 异步客户端：自动登录、401 自动重登、5 QPS 限速。"""
+"""Mfuns API 异步客户端：多账号上下文、自动登录、401 重试、5 QPS 限速。"""
 
 from __future__ import annotations
 
@@ -63,16 +63,53 @@ def _decode_user_id(token: str) -> int | None:
 
 
 class MfunsClient:
-    def __init__(self) -> None:
+    """多账号感知客户端：切换账号后自动加载对应 token/api_key/凭据。"""
+
+    def __init__(self, account_id: str | None = None) -> None:
         self.base_url = config.get_base_url()
         self._http = httpx.AsyncClient(base_url=self.base_url, timeout=30.0)
-        self._token = config.get_token()
-        self._api_key = config.get_api_key()
         self._login_lock = asyncio.Lock()
         self._last_ts = 0.0
+        self._account_id = account_id or config.get_current_account_id()
+        self._token = ""
+        self._api_key = ""
+        self._load_account()
+
+    @property
+    def account_id(self) -> str:
+        return self._account_id
+
+    @property
+    def account_name(self) -> str:
+        acc = config.get_account(self._account_id)
+        return ((acc or {}).get("profile") or {}).get("user_name") or self._account_id
+
+    def reset_to_current(self) -> None:
+        """移除当前账号后回退到配置的当前账号（无账号则清空身份）。"""
+        self._account_id = config.get_current_account_id()
+        self._load_account()
 
     async def aclose(self) -> None:
         await self._http.aclose()
+
+    def _load_account(self) -> None:
+        acc = config.get_account(self._account_id) or {}
+        auth = acc.get("auth") or {}
+        self._token = auth.get("token") or ""
+        self._api_key = auth.get("api_key") or ""
+
+    def _credentials(self) -> tuple[str, str]:
+        acc = config.get_account(self._account_id) or {}
+        auth = acc.get("auth") or {}
+        return auth.get("account") or "", auth.get("password") or ""
+
+    async def _need_login(self) -> bool:
+        account, password = self._credentials()
+        return bool(account and password)
+
+    def _use_api_key(self, path: str) -> bool:
+        """该路径是否应使用官方 API KEY（仅白名单内的投稿接口；其余一律用户 token）。"""
+        return bool(self._api_key) and path in _API_KEY_PATHS
 
     def _headers(self, source: str = "token") -> dict:
         h = {"User-Agent": USER_AGENT}
@@ -89,12 +126,12 @@ class MfunsClient:
         self._last_ts = time.monotonic()
 
     async def login(self) -> str:
-        account, password = config.get_credentials()
+        """当前账号账号密码登录，成功后回写 token 与 profile。"""
+        account, password = self._credentials()
         if not account or not password:
             raise MfunsError(
                 401,
-                "未配置账号密码：请设置环境变量 MFUNS_ACCOUNT / MFUNS_PASSWORD，"
-                "或写入 config.json 的 account / password",
+                f"账号 {self._account_id} 未配置账号密码（auth.account / auth.password）",
             )
         await self._throttle()
         resp = await self._http.post(
@@ -112,9 +149,62 @@ class MfunsClient:
         if not token:
             raise MfunsError(-1, "登录成功但未返回 access_token")
         self._token = token
-        config.set_session(token, _decode_user_id(token))
-        logger.info("登录成功，token 已缓存")
+        uid = _decode_user_id(token)
+        config.update_account(self._account_id, auth={"token": token})
+        config.update_account(self._account_id, profile={"user_id": uid})
+        if self._account_id.startswith("u_unknown") and uid:
+            new_id = f"u_{uid}"
+            config.rename_account(self._account_id, new_id)
+            self._account_id = new_id
+        logger.info("账号 %s 登录成功，token 已缓存", self._account_id)
         return token
+
+    async def switch(self, account_id: str) -> str:
+        """切换当前账号；存在 token 时校验身份并刷新 profile，防串号。
+
+        校验失败自动回滚到原账号，不影响后续操作。
+        """
+        acc = config.get_account(account_id)
+        if not acc:
+            raise MfunsError(-1, f"账号不存在: {account_id}（可用 mfuns_account_list 查看）")
+        if not acc.get("enabled"):
+            raise MfunsError(-1, f"账号已禁用: {account_id}")
+        prev = self._account_id
+        self._account_id = account_id
+        self._load_account()
+        note = ""
+        try:
+            if self._token:
+                info = await self.get("/v1/user/info")
+                user = (info or {}).get("user") or {}
+                uid = user.get("id")
+                if not uid or not (info or {}).get("login"):
+                    raise MfunsError(401, f"账号 {account_id} 的 token 已失效，请配置账号密码自动重登")
+                expect = acc.get("profile", {}).get("user_id")
+                if expect and uid != expect:
+                    raise MfunsError(
+                        -1,
+                        f"身份不匹配: 账号 {account_id} 配置 user_id={expect}，"
+                        f"但 token 属于用户 {uid}（防串号校验，请检查 auth.token）",
+                    )
+                config.update_account(
+                    account_id,
+                    profile={"user_id": uid, "user_name": user.get("name") or ""},
+                )
+                if account_id.startswith("u_unknown"):
+                    new_id = f"u_{uid}"
+                    config.rename_account(account_id, new_id)
+                    self._account_id = new_id
+                    note = f"（临时 id 已更新为 {new_id}）"
+            elif not self._token and not self._api_key:
+                raise MfunsError(401, f"账号 {account_id} 未配置 token 且未配置账号密码，无法使用")
+        except Exception:
+            self._account_id = prev
+            self._load_account()
+            raise
+        config.set_current_account(self._account_id)
+        logger.info("已切换账号 -> %s", self._account_id)
+        return f"已切换至 {self._account_id}（{self.account_name}）{note}"
 
     async def request(
         self,
@@ -127,12 +217,11 @@ class MfunsClient:
         retry: bool = True,
         source: str | None = None,
     ) -> Any:
-        """发送请求并解包统一信封（code==1 返回 data）。
+        """发送请求并解包统一信封（code==1 返回 data），始终使用当前账号身份。
 
         鉴权来源：
-        - 投稿类接口（/v1/contribute/*）优先使用 config.api_key（官方密钥），
-          未配置或 401 时回退用户 token；仍失败则抛错（不自动重登覆盖）
-        - 其余接口全局使用用户 token；401 视为失效自动登录后重试一次
+        - 投稿类接口（/v1/contribute/* 白名单）优先使用当前账号 api_key，401 回退其 token
+        - 其余接口使用当前账号 token；401 视为失效自动登录后重试一次
         - 无 token 时先匿名请求，遇 401 且配置了账号密码则自动登录
         """
         if source is None:
@@ -162,7 +251,7 @@ class MfunsClient:
                     return await self.request(
                         method, path, params, json_body, form, auth, retry=False, source="token"
                     )
-                raise MfunsError(401, "API KEY 无效或已过期（config.json 的 api_key 不自动重登）")
+                raise MfunsError(401, f"账号 {self._account_id} 的 API KEY 无效或已过期")
             logger.info("token 失效或需登录，重新登录")
             async with self._login_lock:
                 await self.login()
@@ -172,15 +261,6 @@ class MfunsClient:
         if code != 1:
             raise MfunsError(code, body.get("msg") or "请求失败")
         return body.get("data")
-
-    @staticmethod
-    async def _need_login() -> bool:
-        account, password = config.get_credentials()
-        return bool(account and password)
-
-    def _use_api_key(self, path: str) -> bool:
-        """该路径是否应使用官方 API KEY（仅白名单内的投稿接口；其余一律用户 token）。"""
-        return bool(self._api_key) and path in _API_KEY_PATHS
 
     async def get(self, path: str, **params) -> Any:
         return await self.request("GET", path, params=params)
@@ -290,14 +370,42 @@ def oss_put(addr_b64: str, auth_b64: str, file_obj, content_type: str = "applica
     if resp.status_code != 200:
         raise MfunsError(-1, f"OSS 上传失败 HTTP {resp.status_code}: {resp.text[:200]}")
 
-    async def default_favorite_list_id(self) -> int:
-        """获取当前用户的第一个收藏夹 ID（默认收藏夹）。"""
-        me = await self.get("/v1/user/info")
-        uid = ((me or {}).get("user") or {}).get("id")
-        if not uid:
-            raise MfunsError(-1, "无法获取当前用户 ID")
-        data = await self.get("/v1/favorite/get_favorite_list", user_id=uid)
-        lists = (data or {}).get("list") or []
-        if not lists:
-            raise MfunsError(-1, "没有可用收藏夹，请先创建收藏夹")
-        return int(lists[0]["id"])
+
+# ---- 独立凭证校验（不依赖当前账号上下文，用于 mfuns_account_add）----
+
+async def api_login(account: str, password: str) -> str:
+    """账号密码登录，返回 access_token。"""
+    async with httpx.AsyncClient(base_url=config.get_base_url(), timeout=30.0) as http:
+        resp = await http.post(
+            "/v1/auth/login",
+            data={"account": account, "password": password},
+            headers={"User-Agent": USER_AGENT},
+        )
+        try:
+            body = resp.json()
+        except ValueError:
+            raise MfunsError(-1, f"登录接口响应异常 HTTP {resp.status_code}")
+        if body.get("code") != 1:
+            raise MfunsError(body.get("code") or -1, f"登录失败: {body.get('msg', '')}")
+        token = (body.get("data") or {}).get("access_token")
+        if not token:
+            raise MfunsError(-1, "登录成功但未返回 access_token")
+        return token
+
+
+async def api_identity(auth: str) -> tuple[int, str]:
+    """用凭证（token 或 api_key）调 /v1/user/info，返回 (user_id, user_name)。"""
+    async with httpx.AsyncClient(base_url=config.get_base_url(), timeout=30.0) as http:
+        resp = await http.get(
+            "/v1/user/info",
+            headers={"User-Agent": USER_AGENT, "Authorization": auth},
+        )
+        try:
+            body = resp.json()
+        except ValueError:
+            raise MfunsError(-1, f"身份校验响应异常 HTTP {resp.status_code}")
+        data = body.get("data") or {}
+        if body.get("code") != 1 or not data.get("login"):
+            raise MfunsError(body.get("code") or -1, body.get("msg") or "身份校验失败")
+        user = data.get("user") or {}
+        return user.get("id"), user.get("name") or ""

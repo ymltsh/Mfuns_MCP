@@ -1,18 +1,18 @@
-"""MCP 工具定义（12 个，中文描述，输出为 LLM 友好的纯文本）。"""
+"""MCP 工具定义（中文描述，输出为 LLM 友好的纯文本）。"""
 
 from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import httpx
-from pathlib import Path
-
 from mcp.server import MCPServer
 
-from .activity import activity, read_activity
-from .client import MfunsClient, MfunsError, oss_put
+from . import config
+from .activity import activity, read_activity, set_account_resolver
+from .client import MfunsClient, MfunsError, api_identity, api_login, oss_put
 from .format import author_name, html_to_text, quill_to_text, text_to_quill, ts_to_str
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,21 @@ def _target_submission(kw: dict) -> dict:
     if kw.get("contribute_id"):
         target["id"] = kw["contribute_id"]
     return target
+
+
+async def _account_remove(client: MfunsClient, account_id: str | None) -> str:
+    """移除账号；若移除的是当前账号，回退到配置的当前账号。"""
+    if not account_id:
+        return "错误: remove 需提供 account_id"
+    if not config.get_account(account_id):
+        return f"错误: 账号不存在: {account_id}（可用 mfuns_account_list 查看）"
+    removed_current = client.account_id == account_id
+    config.remove_account(account_id)
+    if removed_current:
+        client.reset_to_current()
+        back = client.account_id or "（无账号）"
+        return f"已移除账号 {account_id}（原为当前账号，已回退至 {back}）"
+    return f"已移除账号 {account_id}"
 
 
 async def _resolve_category(client: MfunsClient, category_id: int | None) -> tuple[int, str | None]:
@@ -245,8 +260,9 @@ async def _detail_lines(client: MfunsClient, rtype: str, rid: int) -> tuple[list
 
 
 def register_tools(mcp: MCPServer) -> None:
-    """注册全部 12 个 MCP 工具。"""
+    """注册全部 MCP 工具。"""
     client = MfunsClient()
+    set_account_resolver(lambda: client.account_id)
 
     @mcp.tool()
     @activity("browse", _target_browse)
@@ -613,14 +629,28 @@ def register_tools(mcp: MCPServer) -> None:
         lambda kw: f"message_{kw.get('action') or 'list'}",
         lambda kw: {"type": "message", "id": kw.get("user_id") or "list"},
     )
-    async def mfuns_messages(action: str = "list", user_id: int | None = None) -> str:
-        """查看私信会话列表或与某用户的聊天记录。
+    async def mfuns_messages(
+        action: str = "list",
+        user_id: int | None = None,
+        content: str | None = None,
+    ) -> str:
+        """查看私信会话列表 / 读取聊天记录 / 发送私信。
 
         Args:
-            action: 操作，可选: list=会话列表（默认）, read=读取聊天记录
-            user_id: 对方用户 ID（action=read 时必填）
+            action: 操作，可选: list=会话列表（默认）, read=读取聊天记录, send=发送私信
+            user_id: 对方用户 ID（action=read/send 时必填）
+            content: 私信内容（action=send 时必填，纯文本）
         """
         try:
+            if action == "send":
+                if not user_id or not content:
+                    return "错误: send 需提供 user_id 和 content"
+                # 实测：必须 form 编码 + msg 字段（JSON + message 会"发送成功"但内容落空）
+                await client.post(
+                    "/v1/message/send",
+                    form={"to_uid": user_id, "msg": content},
+                )
+                return f"私信已发送（用户 {user_id}）"
             if action == "read":
                 if not user_id:
                     return "错误: action=read 需提供 user_id"
@@ -1085,24 +1115,177 @@ def register_tools(mcp: MCPServer) -> None:
         date: str,
         tool: str | None = None,
         target_id: int | None = None,
+        account_id: str | None = None,
     ) -> str:
-        """查询 Activity Log（每次工具调用的操作记录，按日期隔离的 JSON 文件）。
+        """查询 Activity Log（每次工具调用的操作记录，按账号与日期隔离的 JSON 文件）。
 
         Args:
             date: 日期，格式 YYYY-MM-DD（如 2026-08-02）
             tool: 可选，按工具名过滤（如 mfuns_comment）
             target_id: 可选，按影响对象 ID 过滤（如帖子/评论 ID 83888）
+            account_id: 可选，指定账号（如 u_38461）；不传查询当前账号
         """
         try:
-            logs = read_activity(date)
+            logs = read_activity(date, account_id)
             if tool:
                 logs = [x for x in logs if x.get("tool") == tool]
             if target_id is not None:
                 logs = [x for x in logs if (x.get("target") or {}).get("id") == target_id]
+            who = account_id or f"{client.account_id}（当前）"
             if not logs:
-                return f"{date} 无匹配的 Activity Log"
-            lines = [f"Activity Log（{date}，共 {len(logs)} 条）:"]
+                return f"{who} {date} 无匹配的 Activity Log"
+            lines = [f"Activity Log（{who}，{date}，共 {len(logs)} 条）:"]
             lines.extend(f"- {x.get('time')} {x.get('tool')} | {x.get('action')}" for x in logs)
             return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity(
+        "account_modify",
+        lambda kw: {"type": "account", "id": kw.get("account_id") or kw.get("action")},
+    )
+    async def mfuns_account_modify(
+        action: str = "add",
+        account: str | None = None,
+        password: str | None = None,
+        token: str | None = None,
+        api_key: str | None = None,
+        account_id: str | None = None,
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> str:
+        """添加或移除 Mfuns 账号身份。
+
+        Args:
+            action: 操作，可选: add=添加（默认）, remove=移除
+            account: 手机号或用户名（账号密码登录，验证通过自动缓存 token）
+            password: 密码（与 account 搭配）
+            token: 登录 token 直接导入（自动校验并填充身份信息）
+            api_key: 官方开放平台密钥 mf_xxx（独立于账密/token 体系，仅作投稿接口凭证，不解析身份）
+            account_id: 添加时可指定账号 ID（如 u_38461，缺省按身份自动生成或顺序编号）；remove 时必填（要移除的账号 ID）
+            user_id: 可选，预填用户 ID（与 token 身份不一致会拒绝）
+            user_name: 昵称（纯 api_key 添加时必填；token/账密添加时自动解析可留空）
+        """
+        try:
+            if action == "remove":
+                return await _account_remove(client, account_id)
+            if action != "add":
+                return "错误: action 仅支持 add / remove"
+            if not (account and password) and not token and not api_key:
+                return "错误: 需提供三种凭证之一（account+password / token / api_key）"
+            if account and password and not token:
+                token = await api_login(account, password)
+            uid, name = user_id, user_name
+            if token:
+                uid, name = await api_identity(token)
+                if user_id and uid != user_id:
+                    return f"错误: 身份不匹配，token 属于用户 {uid}，与提供的 user_id={user_id} 不一致"
+                if not user_name:
+                    user_name = name
+            # api_key 独立于账密/token 体系，不参与身份解析（user/info 拒绝 api_key），仅作投稿接口凭证
+            new_id = account_id
+            if not new_id:
+                if uid:
+                    new_id = f"u_{uid}"
+                else:
+                    # 纯 api_key：身份无法解析，id 直接顺序编号，昵称必填
+                    if not user_name:
+                        return "错误: 纯 api_key 添加无法解析身份，请提供昵称 user_name"
+                    used = {a["id"] for a in config.get_accounts()}
+                    n = 1
+                    while f"u_{n}" in used:
+                        n += 1
+                    new_id = f"u_{n}"
+            else:
+                m = re.fullmatch(r"u_(\d+)", new_id)
+                if m and uid and int(m.group(1)) != uid:
+                    return f"错误: account_id {new_id} 与身份（用户 {uid}）不一致"
+            if config.get_account(new_id):
+                return f"错误: 账号已存在: {new_id}（可用 mfuns_account_list 查看）"
+            for a in config.get_accounts():
+                a_auth = a.get("auth") or {}
+                if uid and (a.get("profile") or {}).get("user_id") == uid:
+                    return f"错误: 用户 {uid} 已存在于账号 {a['id']}（勿重复添加）"
+                if token and a_auth.get("token") == token:
+                    return f"错误: 该 token 已绑定到账号 {a['id']}（勿重复导入）"
+                if api_key and a_auth.get("api_key") == api_key:
+                    return f"错误: 该 api_key 已绑定到账号 {a['id']}（勿重复绑定）"
+                if account and a_auth.get("account") == account:
+                    return f"错误: 账号 {account} 已存在于账号 {a['id']}（勿重复添加）"
+            config.add_account(
+                new_id,
+                auth={"account": account or "", "password": password or "", "token": token or "", "api_key": api_key or ""},
+                profile={"user_id": uid, "user_name": user_name or ""},
+            )
+            return (
+                f"已添加账号 {new_id} | 用户ID: {uid or '未解析'} | 名称: {user_name or '未知'}"
+                f" | token: {'有' if token else '无'} | api_key: {'有' if api_key else '无'}\n"
+                f"提示: 切换请用 mfuns_account_switch(account_id={new_id})"
+            )
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("account_list", lambda kw: {"type": "account"})
+    async def mfuns_account_list() -> str:
+        """查看 MCP 当前管理的所有账号。
+
+        Args:
+            无参数：返回账号列表，active 标记当前操作身份
+        """
+        try:
+            accounts = config.get_accounts()
+            if not accounts:
+                return "暂无账号配置（请编辑 config.json 的 accounts）"
+            current = client.account_id
+            lines = [f"账号列表（{len(accounts)} 个）:"]
+            for a in accounts:
+                if not a.get("enabled"):
+                    continue
+                p = a.get("profile") or {}
+                mark = " <- 当前" if a.get("id") == current else ""
+                lines.append(
+                    f"- {a.get('id')} | 用户ID: {p.get('user_id') or '未登录'}"
+                    f" | 名称: {p.get('user_name') or '未知'}"
+                    f" | token: {'有' if (a.get('auth') or {}).get('token') else '无'}"
+                    f" | api_key: {'有' if (a.get('auth') or {}).get('api_key') else '无'}{mark}"
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity("account_current", lambda kw: {"type": "account", "id": "current"})
+    async def mfuns_account_current() -> str:
+        """查看当前操作身份（发布前确认身份用）。
+
+        Args:
+            无参数：返回当前账号 id / user_id / user_name
+        """
+        try:
+            acc = config.get_account(client.account_id) or {}
+            p = acc.get("profile") or {}
+            return (
+                f"当前账号: {client.account_id}"
+                f" | 用户ID: {p.get('user_id') or '未登录'}"
+                f" | 名称: {p.get('user_name') or '未知'}"
+            )
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
+    @activity(
+        "account_switch",
+        lambda kw: {"type": "account", "id": kw.get("account_id")},
+    )
+    async def mfuns_account_switch(account_id: str) -> str:
+        """切换当前操作账号（校验身份后生效，后续所有业务工具自动使用该账号）。
+
+        Args:
+            account_id: 目标账号 ID（如 u_38461，可用 mfuns_account_list 查看）
+        """
+        try:
+            return await client.switch(account_id)
         except Exception as e:
             return _fmt_err(e)

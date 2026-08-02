@@ -1,7 +1,8 @@
-"""纯 Activity Log：每次 MCP 工具调用记录一条，按日期隔离为 JSON 文件。
+"""纯 Activity Log：每次 MCP 工具调用记录一条，按账号与日期隔离为 JSON 文件。
 
 目录结构:
-    logs/activity/YYYY-MM-DD.json
+    logs/activity/{account_id}/YYYY-MM-DD.json     （多账号模式，每账号独立目录）
+    logs/activity/YYYY-MM-DD.json                  （兼容：无账号上下文的旧路径）
 
 不存储 LLM 思考/完整上下文，只记录最小操作信息，可随时迁移到数据库。
 """
@@ -15,11 +16,24 @@ from pathlib import Path
 from typing import Any, Callable
 
 # 基于项目根目录（与 cwd 无关，兼容 AstrBot 等外部启动方式）
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs" / "activity"
+LOG_BASE = Path(__file__).resolve().parent.parent / "logs" / "activity"
+
 _MAX_STR = 200
 _MAX_LIST = 20
 
 _lock = asyncio.Lock()
+
+# 当前账号解析器（由 server 启动时注入，用于日志目录归属）
+_account_resolver: Callable[[], str | None] | None = None
+
+
+def set_account_resolver(fn: Callable[[], str | None]) -> None:
+    global _account_resolver
+    _account_resolver = fn
+
+
+def _account_dir(account_id: str | None) -> Path:
+    return LOG_BASE / account_id if account_id else LOG_BASE
 
 
 def _truncate(value: Any) -> Any:
@@ -39,10 +53,16 @@ async def write_activity(
     target: dict | None = None,
     params: dict | None = None,
     result: dict | None = None,
+    account_id: str | None = None,
 ) -> None:
-    """追加一条 Activity Log 到当日文件。"""
+    """追加一条 Activity Log 到当前账号当日文件。"""
+    if account_id is None and _account_resolver is not None:
+        try:
+            account_id = _account_resolver()
+        except Exception:
+            account_id = None
     now = datetime.now()
-    file = LOG_DIR / f"{now:%Y-%m-%d}.json"
+    file = _account_dir(account_id) / f"{now:%Y-%m-%d}.json"
     record: dict = {
         "time": now.strftime("%H:%M:%S"),
         "tool": tool,
@@ -63,9 +83,14 @@ async def write_activity(
         file.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def read_activity(date: str) -> list[dict]:
-    """读取某日 Activity Log（文件不存在或损坏返回空列表）。"""
-    file = LOG_DIR / f"{date}.json"
+def read_activity(date: str, account_id: str | None = None) -> list[dict]:
+    """读取某账号某日 Activity Log（文件不存在或损坏返回空列表）。"""
+    if account_id is None and _account_resolver is not None:
+        try:
+            account_id = _account_resolver()
+        except Exception:
+            account_id = None
+    file = _account_dir(account_id) / f"{date}.json"
     try:
         logs = json.loads(file.read_text(encoding="utf-8"))
         return logs if isinstance(logs, list) else []

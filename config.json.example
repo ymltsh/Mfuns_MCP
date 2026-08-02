@@ -1,8 +1,36 @@
 {
   "base_url": "https://api.mfuns.net",
-  "account": "",
-  "password": "",
-  "token": "",
-  "api_key": "",
-  "user_id": null
+  "accounts": [
+    {
+      "id": "u_38461",
+      "profile": {
+        "user_id": 38461,
+        "user_name": "Sincerely"
+      },
+      "auth": {
+        "account": "手机号或用户名",
+        "password": "密码",
+        "token": "登录 token（可选，留空自动登录）",
+        "api_key": "官方开放平台密钥 mf_xxx（可选，仅投稿接口用）"
+      },
+      "enabled": true
+    },
+    {
+      "id": "u_unknown_1",
+      "profile": {
+        "user_id": null,
+        "user_name": ""
+      },
+      "auth": {
+        "account": "第二个账号",
+        "password": "密码",
+        "token": "",
+        "api_key": ""
+      },
+      "enabled": true
+    }
+  ],
+  "runtime": {
+    "current_account": "u_38461"
+  }
 }
