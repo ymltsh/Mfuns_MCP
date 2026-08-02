@@ -23,6 +23,7 @@ _DEFAULTS: dict = {
     "account": "",
     "password": "",
     "token": "",
+    "api_key": "",
     "user_id": None,
 }
 
@@ -52,6 +53,11 @@ def get_credentials() -> tuple[str, str]:
 
 def get_token() -> str:
     return _ensure_file().get("token") or ""
+
+
+def get_api_key() -> str:
+    """官方开放平台 API KEY（mf_ 前缀），可选；仅用于投稿类接口。"""
+    return _ensure_file().get("api_key") or ""
 
 
 def get_user_id() -> int | None:

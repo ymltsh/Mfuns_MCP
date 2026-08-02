@@ -7,10 +7,12 @@ import logging
 from typing import Any
 
 import httpx
+from pathlib import Path
+
 from mcp.server import MCPServer
 
 from .activity import activity, read_activity
-from .client import MfunsClient, MfunsError
+from .client import MfunsClient, MfunsError, oss_put
 from .format import author_name, html_to_text, quill_to_text, text_to_quill, ts_to_str
 
 logger = logging.getLogger(__name__)
@@ -866,37 +868,108 @@ def register_tools(mcp: MCPServer) -> None:
             return _fmt_err(e)
 
     @mcp.tool()
+    @activity("upload_video", lambda kw: {"type": "video"})
+    async def mfuns_upload_video(
+        file_path: str,
+        title: str,
+        content: str = "",
+        category_id: int | None = None,
+        cover: str = "",
+        copyright: int = 0,
+        tags: list[str] | None = None,
+        extra_files: list[str] | None = None,
+    ) -> str:
+        """本地上传视频并投稿（阿里云 VOD 全流程，支持分P：extra_files 为 P2 起的本地文件）。
+
+        Args:
+            file_path: 本地视频文件路径（P1，支持 mp4/mov/mkv/flv/avi/wmv/webm/mpeg4/ts/mpg/rm/rmvb/m4v）
+            title: 标题（最长 30 字）
+            content: 简介（纯文本）
+            category_id: 分类 ID（须为叶子分区；传父级分区会自动落到其第一个叶子子分区，缺省默认 1 动画>MMD.3D 请显式指定）
+            cover: 封面图 https 外链（视频投稿必填）
+            copyright: 版权，0=其他（默认，适合转载），1=转载，2=原创
+            tags: 标签列表，最多 10 个
+            extra_files: 额外分P 的本地文件路径列表（P2、P3…）
+        """
+        try:
+            paths = [Path(file_path)] + [Path(p) for p in (extra_files or [])]
+            if not cover:
+                return "错误: 视频投稿需提供封面图 https 外链（cover 参数）"
+            for p in paths:
+                if not p.is_file():
+                    return f"错误: 文件不存在 {p}"
+                if p.stat().st_size <= 0:
+                    return f"错误: 文件为空 {p}"
+            videos: list[dict] = []
+            for i, p in enumerate(paths, start=1):
+                auth = await client.video_upload_auth(p.name, p.stat().st_size)
+                with p.open("rb") as f:
+                    oss_put(auth.get("UploadAddress", ""), auth.get("UploadAuth", ""), f)
+                record = await client.video_upload_complete(auth["VideoId"])
+                direct_id = record.get("id")
+                if not direct_id:
+                    return f"错误: 分P{i} 上传完成记录缺少视频库 ID"
+                videos.append(
+                    # type=direct 的 content 需为视频库记录的数字 ID（VOD 字符串 ID 会报"视频不存在"）
+                    {"type": "direct", "content": str(direct_id), "title": title if i == 1 else f"P{i}"}
+                )
+            cid, note = await _resolve_category(client, category_id)
+            payload: dict = {
+                "cid": cid,
+                "title": title,
+                "content": text_to_quill(content or ""),
+                "video": json.dumps(videos, ensure_ascii=False),
+                "copyright": copyright,
+            }
+            if tags:
+                payload["tags"] = ",".join(tags[:10])
+            if cover:
+                payload["cover"] = cover
+            data = await client.post("/v1/contribute/video/create", json_body=payload)
+            con = (data or {}).get("contribute") or {}
+            msg = f"视频上传投稿成功: 投稿ID {con.get('id', '?')}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}（{len(videos)} 分P）"
+            if note:
+                msg += f"\n提示: {note}"
+            return msg
+        except Exception as e:
+            return _fmt_err(e)
+
+    @mcp.tool()
     @activity("publish_video", lambda kw: {"type": "video"})
     async def mfuns_publish_video(
         title: str,
         video_url: str,
         content: str = "",
         category_id: int | None = None,
-        cover: str | None = None,
+        cover: str = "",
         copyright: int = 0,
         tags: list[str] | None = None,
+        parts: list[str] | None = None,
     ) -> str:
-        """外链视频投稿（视频直链 URL，如复活失效的 B 站外链视频；不含本地上传）。
+        """外链视频投稿（视频直链 URL，支持分P：parts 为 P2 起的外链 URL 列表）。
 
         Args:
             title: 标题（最长 30 字）
-            video_url: 视频直链 URL（https）
+            video_url: 视频直链 URL（P1，https）
             content: 简介（纯文本）
-            category_id: 分类 ID（须为叶子分区；传父级分区会自动落到其第一个叶子子分区，缺省默认 1 动画>MMD.3D 请显式指定；如 20=游戏综合）
-            cover: 封面图 https 外链（可选）
+            category_id: 分类 ID（须为叶子分区；传父级分区会自动落到其第一个叶子子分区，缺省默认 1 动画>MMD.3D 请显式指定）
+            cover: 封面图 https 外链（视频投稿必填）
             copyright: 版权，0=其他（默认，适合转载），1=转载，2=原创
             tags: 标签列表，最多 10 个
+            parts: 额外分P 的外链 URL 列表（P2、P3…）
         """
         try:
+            if not cover:
+                return "错误: 视频投稿需提供封面图 https 外链（cover 参数）"
+            videos: list[dict] = [{"type": "link", "content": video_url, "title": title}]
+            for i, url in enumerate(parts or [], start=2):
+                videos.append({"type": "link", "content": url, "title": f"P{i}"})
             cid, note = await _resolve_category(client, category_id)
             payload: dict = {
                 "cid": cid,
                 "title": title,
                 "content": text_to_quill(content or ""),
-                "video": json.dumps(
-                    [{"type": "link", "content": video_url, "title": title}],
-                    ensure_ascii=False,
-                ),
+                "video": json.dumps(videos, ensure_ascii=False),
                 "copyright": copyright,
             }
             if tags:
@@ -931,8 +1004,11 @@ def register_tools(mcp: MCPServer) -> None:
         tags: list[str] | None = None,
         cover: str | None = None,
         draft: bool | None = None,
+        video_url: str | None = None,
+        video_id: str | None = None,
+        copyright: int | None = None,
     ) -> str:
-        """管理我的投稿：查看列表 / 更新文章投稿 / 删除文章投稿。
+        """管理我的投稿：查看列表 / 更新投稿（文章或视频）/ 删除文章投稿。
 
         Args:
             type: 稿件类型，可选: article=文章, video=视频
@@ -942,11 +1018,14 @@ def register_tools(mcp: MCPServer) -> None:
             size: 每页数量，默认 20，最大 100
             status: 状态过滤（list 可选）: 0草稿 1已发布 2待审核 3锁定 4退回修改 5定时发布
             title: 新标题（update 必填）
-            content: 新正文（update 必填，纯文本或 Markdown）
+            content: 新正文/简介（update 必填，纯文本或 Markdown）
             category_id: 新分类 ID（update 必填）
             tags: 新标签（update 可选）
             cover: 新封面（update 可选）
-            draft: 更新后是否保持草稿（update 可选，不传则进入审核队列；草稿稿件更新建议传 true）
+            draft: 更新后是否保持草稿（文章 update 可选，不传则进入审核队列；草稿稿件更新建议传 true）
+            video_url: 视频新外链直链 URL（视频 update 时提供 video_url 或 video_id 之一）
+            video_id: 视频新 VOD ID（本地上传的视频 ID，视频 update 时提供 video_url 或 video_id 之一）
+            copyright: 新版权（update 可选，文章默认 2，视频默认 0）
         """
         try:
             atype = _ARTICLE_TYPE.get(type)
@@ -971,32 +1050,48 @@ def register_tools(mcp: MCPServer) -> None:
                     )
                 return "\n".join(lines)
             if action == "update":
-                if type != "article":
-                    return "错误: v0.1 仅支持更新文章投稿（视频更新需完整视频数据）"
                 if not contribute_id or not title or content is None or not category_id:
                     return "错误: update 需提供 contribute_id / title / content / category_id"
                 payload: dict = {
                     "contribute_id": contribute_id,
                     "cid": category_id,
                     "title": title,
-                    "content": content,
-                    "content_format": "markdown",
-                    "copyright": 2,
+                    "copyright": copyright if copyright is not None else (2 if type == "article" else 0),
                 }
                 if tags:
                     payload["tags"] = ",".join(tags[:10])
                 if cover:
                     payload["cover"] = cover
-                if draft is not None:
-                    payload["draft"] = draft
-                data = await client.post(
-                    "/v1/contribute/article/update", json_body=payload
-                )
+                if type == "article":
+                    payload["content"] = content
+                    payload["content_format"] = "markdown"
+                    if draft is not None:
+                        payload["draft"] = draft
+                    data = await client.post(
+                        "/v1/contribute/article/update", json_body=payload
+                    )
+                else:
+                    if not video_url and not video_id:
+                        return "错误: 视频 update 需提供 video_url（外链）或 video_id（本地上传的 VOD ID）"
+                    if not cover:
+                        return "错误: 视频 update 需提供 cover 封面图 https 外链"
+                    payload["content"] = text_to_quill(content)
+                    payload["video"] = json.dumps(
+                        [{
+                            "type": "direct" if video_id else "link",
+                            "content": video_id or video_url,
+                            "title": title,
+                        }],
+                        ensure_ascii=False,
+                    )
+                    data = await client.post(
+                        "/v1/contribute/video/update", json_body=payload
+                    )
                 con = (data or {}).get("contribute") or {}
                 return f"更新成功: 投稿ID {con.get('id', contribute_id)}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}"
             if action == "delete":
                 if type != "article":
-                    return "错误: v0.1 仅支持删除文章投稿"
+                    return "错误: v0.1 仅支持删除文章投稿（视频投稿请在网页端处理）"
                 if not contribute_id:
                     return "错误: delete 需提供 contribute_id"
                 await client.post(
