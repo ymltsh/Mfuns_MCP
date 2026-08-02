@@ -33,10 +33,6 @@ _STATUS_TEXT = {
 
 # ---- Activity Log 目标/动作派生（装饰器用）----
 
-def _target_article(kw: dict) -> dict:
-    return {"type": "article", "id": kw.get("article_id")}
-
-
 def _target_user(kw: dict) -> dict:
     return {"type": "user", "id": kw.get("user_id")}
 
@@ -163,6 +159,91 @@ async def _comment_block(client: MfunsClient, c: dict, with_replies: bool) -> st
     return line
 
 
+def _like_count(data: dict) -> str:
+    ls = data.get("like_status")
+    if isinstance(ls, dict):
+        return (ls.get("like") or {}).get("count", "?")
+    return "?"
+
+
+def _category_name(data: dict) -> str:
+    cat = data.get("category")
+    if isinstance(cat, dict):
+        return cat.get("name") or ""
+    return str(cat) if cat else ""
+
+
+async def _detail_lines(client: MfunsClient, rtype: str, rid: int) -> tuple[list[str], int | None]:
+    """读取内容详情（不含评论区），返回 (行列表, 评论区 area_id)。"""
+    if rtype == "article":
+        data = await client.get("/v1/article/get", id=rid, html=1)
+        if not isinstance(data, dict) or not data.get("article"):
+            raise MfunsError(-1, "文章不存在或无法访问")
+        art = data["article"]
+        tags = data.get("tag") or data.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        lines = [
+            f"标题: {art.get('title') or '无标题'}",
+            f"作者: {author_name(data)} | 发布时间: {ts_to_str(art.get('created_at'))}",
+            f"分类: {_category_name(data) or '未知'} | 浏览: {data.get('view_count', '?')}"
+            f" | 赞: {_like_count(data)} | 收藏: {data.get('favorite_count', '?')}"
+            f" | 打赏: {data.get('reward_count', '?')}",
+            f"链接: https://m.mfuns.net/article/{rid}",
+        ]
+        if tags:
+            lines.append("标签: " + "、".join(str(t) for t in tags))
+        lines.append("---正文---")
+        lines.append(html_to_text(art.get("content") or "") or "(无正文)")
+        return lines, art.get("comment_area_id")
+    if rtype == "video":
+        data = await client.get("/v1/video/get", id=rid, html=1)
+        if not isinstance(data, dict) or not data.get("id"):
+            raise MfunsError(-1, "视频不存在或无法访问")
+        tags = data.get("tags") or data.get("tag") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        dur = data.get("duration") or 0
+        cc = data.get("comments")
+        if isinstance(cc, dict):
+            cc = cc.get("floor_count", "?")
+        lines = [
+            f"标题: {data.get('title') or '无标题'}",
+            f"作者: {author_name(data)} | 发布时间: {ts_to_str(data.get('published_at') or data.get('created_at'))}",
+            f"分类: {_category_name(data) or '未知'} | 播放: {data.get('view_count', '?')}"
+            f" | 赞: {_like_count(data)} | 评论: {cc}"
+            f" | 收藏: {data.get('favorite_count', '?')} | 时长: {int(dur // 60)}分{int(dur % 60)}秒",
+            f"链接: https://m.mfuns.net/video/{rid}",
+        ]
+        if tags:
+            lines.append("标签: " + "、".join(str(t) for t in tags))
+        vids = data.get("videos") or []
+        if isinstance(vids, list) and vids:
+            lines.append("分P: " + ", ".join(str(v.get("title") or "?") for v in vids))
+        lines.append("---简介---")
+        lines.append(html_to_text(data.get("content") or "") or "(无简介)")
+        return lines, data.get("comment_area_id")
+    # feed
+    data = await client.get("/v1/feeds/get", id=rid, html=1)
+    if not isinstance(data, dict) or not data.get("id"):
+        raise MfunsError(-1, "动态不存在或无法访问")
+    tags = data.get("tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    lines = [
+        f"动态 #{rid}",
+        f"作者: {author_name(data)} | 发布: {ts_to_str(data.get('created_at'))}"
+        f" | 阅读: {data.get('views', '?')} | 赞: {_like_count(data)}"
+        f" | 评论: {data.get('floor_count', '?')}",
+        f"链接: https://m.mfuns.net/feed/{rid}",
+    ]
+    if tags:
+        lines.append("标签: " + "、".join(str(t) for t in tags))
+    lines.append("---内容---")
+    lines.append(html_to_text(data.get("content") or "") or "(无内容)")
+    return lines, data.get("comment_area_id")
+
+
 def register_tools(mcp: MCPServer) -> None:
     """注册全部 12 个 MCP 工具。"""
     client = MfunsClient()
@@ -226,172 +307,25 @@ def register_tools(mcp: MCPServer) -> None:
             return _fmt_err(e)
 
     @mcp.tool()
-    @activity("read", _target_article)
-    async def mfuns_read_thread(
-        article_id: int,
+    @activity("read", lambda kw: {"type": kw.get("resource_type") or "article", "id": kw.get("resource_id")})
+    async def mfuns_read(
+        resource_id: int,
+        resource_type: str = "article",
         comment_depth: int = 1,
         comment_limit: int = 30,
     ) -> str:
-        """读取帖子详情与评论区（最常用的读取工具，回复前必读）。
+        """读取内容详情与评论区（帖子/视频/动态，回复前必读）。
 
         Args:
-            article_id: 文章 ID
+            resource_type: 资源类型，可选: article=帖子（默认）, video=视频, feed=动态
+            resource_id: 内容 ID（文章/视频/动态 ID）
             comment_depth: 评论层级，1=只看一楼评论（默认），2=一楼评论加回复
             comment_limit: 返回的评论条数上限，默认 30
         """
         try:
-            data = await client.get("/v1/article/get", id=article_id, html=1)
-            if not isinstance(data, dict) or not data.get("article"):
-                return "错误: 文章不存在或无法访问"
-            art = data["article"]
-            title = art.get("title") or "无标题"
-            body = html_to_text(art.get("content") or "")
-            cat = ""
-            if isinstance(data.get("category"), dict):
-                cat = data["category"].get("name") or ""
-            elif data.get("category"):
-                cat = str(data["category"])
-            tags = data.get("tag") or data.get("tags") or []
-            if isinstance(tags, str):
-                tags = [tags]
-            like = ""
-            if isinstance(data.get("like_status"), dict):
-                like = (data["like_status"].get("like") or {}).get("count", "?")
-            else:
-                like = "?"
-            lines = [
-                f"标题: {title}",
-                f"作者: {author_name(data)} | 发布时间: {ts_to_str(art.get('created_at'))}",
-                f"分类: {cat or '未知'} | 浏览: {data.get('view_count', '?')}"
-                f" | 赞: {like} | 收藏: {data.get('favorite_count', '?')}"
-                f" | 打赏: {data.get('reward_count', '?')}",
-                f"链接: https://m.mfuns.net/article/{article_id}",
-            ]
-            if tags:
-                lines.append("标签: " + "、".join(str(t) for t in tags))
-            lines.append("---正文---")
-            lines.append(body or "(无正文)")
-            area_id = art.get("comment_area_id")
-            if area_id:
-                comments = await client.get(
-                    "/v1/comment/list",
-                    area_id=area_id,
-                    page=1,
-                    order="desc",
-                    html=1,
-                )
-                clist = _ensure_list(comments)[:comment_limit]
-                lines.append(f"---评论（显示 {len(clist)} 条）---")
-                for c in clist:
-                    lines.append(await _comment_block(client, c, comment_depth >= 2))
-            return "\n".join(lines)
-        except Exception as e:
-            return _fmt_err(e)
-
-    @mcp.tool()
-    @activity("read_video", lambda kw: {"type": "video", "id": kw.get("video_id")})
-    async def mfuns_read_video(
-        video_id: int,
-        comment_depth: int = 1,
-        comment_limit: int = 30,
-    ) -> str:
-        """读取视频详情与评论区。
-
-        Args:
-            video_id: 视频 ID
-            comment_depth: 评论层级，1=只看一楼评论（默认），2=一楼评论加回复
-            comment_limit: 返回的评论条数上限，默认 30
-        """
-        try:
-            data = await client.get("/v1/video/get", id=video_id, html=1)
-            if not isinstance(data, dict) or not data.get("id"):
-                return "错误: 视频不存在或无法访问"
-            title = data.get("title") or "无标题"
-            body = html_to_text(data.get("content") or "")
-            cat = ""
-            if isinstance(data.get("category"), dict):
-                cat = data["category"].get("name") or ""
-            elif data.get("category"):
-                cat = str(data["category"])
-            tags = data.get("tags") or data.get("tag") or []
-            if isinstance(tags, str):
-                tags = [tags]
-            like = ""
-            if isinstance(data.get("like_status"), dict):
-                like = (data["like_status"].get("like") or {}).get("count", "?")
-            else:
-                like = "?"
-            dur = data.get("duration") or 0
-            comments_count = data.get("comments")
-            if isinstance(comments_count, dict):
-                comments_count = comments_count.get("floor_count", "?")
-            lines = [
-                f"标题: {title}",
-                f"作者: {author_name(data)} | 发布时间: {ts_to_str(data.get('published_at') or data.get('created_at'))}",
-                f"分类: {cat or '未知'} | 播放: {data.get('view_count', '?')}"
-                f" | 赞: {like} | 评论: {comments_count}"
-                f" | 收藏: {data.get('favorite_count', '?')} | 时长: {int(dur // 60)}分{int(dur % 60)}秒",
-                f"链接: https://m.mfuns.net/video/{video_id}",
-            ]
-            if tags:
-                lines.append("标签: " + "、".join(str(t) for t in tags))
-            vids = data.get("videos") or []
-            if isinstance(vids, list) and vids:
-                lines.append("分P: " + ", ".join(str(v.get("title") or "?") for v in vids))
-            lines.append("---简介---")
-            lines.append(body or "(无简介)")
-            area_id = data.get("comment_area_id")
-            if area_id:
-                comments = await client.get(
-                    "/v1/comment/list", area_id=area_id, page=1, order="desc", html=1
-                )
-                clist = _ensure_list(comments)[:comment_limit]
-                lines.append(f"---评论（显示 {len(clist)} 条）---")
-                for c in clist:
-                    lines.append(await _comment_block(client, c, comment_depth >= 2))
-            return "\n".join(lines)
-        except Exception as e:
-            return _fmt_err(e)
-
-    @mcp.tool()
-    @activity("read_feed", lambda kw: {"type": "feed", "id": kw.get("feed_id")})
-    async def mfuns_read_feed(
-        feed_id: int,
-        comment_depth: int = 1,
-        comment_limit: int = 30,
-    ) -> str:
-        """读取动态详情与评论区。
-
-        Args:
-            feed_id: 动态 ID
-            comment_depth: 评论层级，1=只看一楼评论（默认），2=一楼评论加回复
-            comment_limit: 返回的评论条数上限，默认 30
-        """
-        try:
-            data = await client.get("/v1/feeds/get", id=feed_id, html=1)
-            if not isinstance(data, dict) or not data.get("id"):
-                return "错误: 动态不存在或无法访问"
-            body = html_to_text(data.get("content") or "")
-            tags = data.get("tags") or []
-            if isinstance(tags, str):
-                tags = [tags]
-            like = ""
-            if isinstance(data.get("like_status"), dict):
-                like = (data["like_status"].get("like") or {}).get("count", "?")
-            else:
-                like = "?"
-            lines = [
-                f"动态 #{feed_id}",
-                f"作者: {author_name(data)} | 发布: {ts_to_str(data.get('created_at'))}"
-                f" | 阅读: {data.get('views', '?')} | 赞: {like}"
-                f" | 评论: {data.get('floor_count', '?')}",
-                f"链接: https://m.mfuns.net/feed/{feed_id}",
-            ]
-            if tags:
-                lines.append("标签: " + "、".join(str(t) for t in tags))
-            lines.append("---内容---")
-            lines.append(body or "(无内容)")
-            area_id = data.get("comment_area_id")
+            if resource_type not in ("article", "video", "feed"):
+                return "错误: resource_type 仅支持 article / video / feed"
+            lines, area_id = await _detail_lines(client, resource_type, resource_id)
             if area_id:
                 comments = await client.get(
                     "/v1/comment/list", area_id=area_id, page=1, order="desc", html=1
@@ -649,11 +583,11 @@ def register_tools(mcp: MCPServer) -> None:
         lambda kw: {"type": kw.get("target_type"), "id": kw.get("target_id")},
     )
     async def mfuns_delete(target_type: str, target_id: int) -> str:
-        """删除内容（动态或评论，仅限本人内容）。
+        """删除内容（动态/评论/文章投稿，仅限本人内容）。
 
         Args:
-            target_type: 删除对象，可选: feed=动态, comment=评论
-            target_id: 对象 ID（动态 ID / 评论 ID）
+            target_type: 删除对象，可选: feed=动态, comment=评论, article=文章投稿
+            target_id: 对象 ID（动态 ID / 评论 ID / 投稿 ID）
         """
         try:
             if target_type == "feed":
@@ -664,7 +598,13 @@ def register_tools(mcp: MCPServer) -> None:
                     "/v1/comment/delete", json_body={"comment_id": target_id}
                 )
                 return f"已删除评论 {target_id}"
-            return "错误: target_type 仅支持 feed / comment"
+            if target_type == "article":
+                await client.post(
+                    "/v1/contribute/article/delete",
+                    json_body={"contribute_id": target_id},
+                )
+                return f"已删除文章投稿 {target_id}"
+            return "错误: target_type 仅支持 feed / comment / article"
         except Exception as e:
             return _fmt_err(e)
 
@@ -868,8 +808,8 @@ def register_tools(mcp: MCPServer) -> None:
             return _fmt_err(e)
 
     @mcp.tool()
-    @activity("upload_video", lambda kw: {"type": "video"})
-    async def mfuns_upload_video(
+    @activity("publish_video_upload", lambda kw: {"type": "video"})
+    async def mfuns_publish_video_upload(
         file_path: str,
         title: str,
         content: str = "",
@@ -935,8 +875,8 @@ def register_tools(mcp: MCPServer) -> None:
             return _fmt_err(e)
 
     @mcp.tool()
-    @activity("publish_video", lambda kw: {"type": "video"})
-    async def mfuns_publish_video(
+    @activity("publish_video_link", lambda kw: {"type": "video"})
+    async def mfuns_publish_video_link(
         title: str,
         video_url: str,
         content: str = "",
@@ -1006,14 +946,15 @@ def register_tools(mcp: MCPServer) -> None:
         draft: bool | None = None,
         video_url: str | None = None,
         video_id: str | None = None,
+        parts: list[str] | None = None,
         copyright: int | None = None,
     ) -> str:
-        """管理我的投稿：查看列表 / 更新投稿（文章或视频）/ 删除文章投稿。
+        """管理我的投稿：查看列表/详情 / 更新投稿（文章或视频，支持分P编辑）。
 
         Args:
             type: 稿件类型，可选: article=文章, video=视频
-            action: 操作，可选: list=列表（默认）, update=更新, delete=删除
-            contribute_id: 投稿 ID（update/delete 必填）
+            action: 操作，可选: list=列表（默认）, get=详情, update=更新
+            contribute_id: 投稿 ID（get/update 必填）
             page: 页码，默认 1
             size: 每页数量，默认 20，最大 100
             status: 状态过滤（list 可选）: 0草稿 1已发布 2待审核 3锁定 4退回修改 5定时发布
@@ -1023,8 +964,10 @@ def register_tools(mcp: MCPServer) -> None:
             tags: 新标签（update 可选）
             cover: 新封面（update 可选）
             draft: 更新后是否保持草稿（文章 update 可选，不传则进入审核队列；草稿稿件更新建议传 true）
-            video_url: 视频新外链直链 URL（视频 update 时提供 video_url 或 video_id 之一）
-            video_id: 视频新 VOD ID（本地上传的视频 ID，视频 update 时提供 video_url 或 video_id 之一）
+            video_url: P1 外链直链 URL（视频 update 时提供 video_url 或 video_id 之一，作为 P1）
+            video_id: P1 本地上传 VOD 库 ID（视频 update 时提供 video_url 或 video_id 之一，作为 P1）
+            parts: 分P 列表（P2 起）；与 P1 同类型（video_url 时为外链 URL，video_id 时为 VOD 库 ID）；
+                   仅提供 parts 且未提供 P1 时，自动追加到现有稿件末尾（作为 link 外链分P）
             copyright: 新版权（update 可选，文章默认 2，视频默认 0）
         """
         try:
@@ -1049,6 +992,29 @@ def register_tools(mcp: MCPServer) -> None:
                         f" | 创建: {ts_to_str(it.get('created_at'))}"
                     )
                 return "\n".join(lines)
+            if action == "get":
+                if not contribute_id:
+                    return "错误: get 需提供 contribute_id"
+                data = await client.get("/v1/contribute/get", contribute_id=contribute_id)
+                con = (data or {}).get("contribute") or {}
+                if not con:
+                    return "错误: 投稿不存在"
+                lines = [
+                    f"投稿ID {con.get('id')} | 状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}"
+                    f" | 资源ID {con.get('resource_id') or '-'}",
+                    f"标题: {con.get('title')}",
+                    f"分类: {con.get('category_id')} | 标签: {'、'.join(con.get('tags') or []) or '无'}",
+                ]
+                if con.get("cover"):
+                    lines.append(f"封面: {con['cover']}")
+                videos = con.get("videos") or []
+                if isinstance(videos, list) and videos:
+                    lines.append("分P:")
+                    lines.extend(
+                        f"  P{i} ({v.get('type')}): {v.get('title')} | {v.get('content')}"
+                        for i, v in enumerate(videos, start=1)
+                    )
+                return "\n".join(lines)
             if action == "update":
                 if not contribute_id or not title or content is None or not category_id:
                     return "错误: update 需提供 contribute_id / title / content / category_id"
@@ -1071,35 +1037,45 @@ def register_tools(mcp: MCPServer) -> None:
                         "/v1/contribute/article/update", json_body=payload
                     )
                 else:
-                    if not video_url and not video_id:
-                        return "错误: 视频 update 需提供 video_url（外链）或 video_id（本地上传的 VOD ID）"
+                    if video_url and video_id:
+                        return "错误: video_url 与 video_id 不能同时提供（P1 只能选外链或本地上传）"
+                    if not video_url and not video_id and not parts:
+                        return "错误: 视频 update 需提供 video_url/video_id（P1）或 parts（追加分P）"
                     if not cover:
                         return "错误: 视频 update 需提供 cover 封面图 https 外链"
+                    if video_url or video_id:
+                        videos: list[dict] = [
+                            {
+                                "type": "direct" if video_id else "link",
+                                "content": video_id or video_url,
+                                "title": title,
+                            }
+                        ]
+                        for i, p in enumerate(parts or [], start=2):
+                            videos.append(
+                                {"type": "direct" if video_id else "link", "content": p, "title": f"P{i}"}
+                            )
+                    else:
+                        # 仅 parts：读取现有分P，追加为 link 外链分P
+                        cur = await client.get(
+                            "/v1/contribute/get", contribute_id=contribute_id
+                        )
+                        cur_videos = ((cur or {}).get("contribute") or {}).get("videos") or []
+                        videos = [dict(v) for v in cur_videos if isinstance(v, dict)]
+                        base = len(videos)
+                        for i, p in enumerate(parts or [], start=base + 1):
+                            videos.append({"type": "link", "content": p, "title": f"P{i}"})
                     payload["content"] = text_to_quill(content)
-                    payload["video"] = json.dumps(
-                        [{
-                            "type": "direct" if video_id else "link",
-                            "content": video_id or video_url,
-                            "title": title,
-                        }],
-                        ensure_ascii=False,
-                    )
+                    payload["video"] = json.dumps(videos, ensure_ascii=False)
                     data = await client.post(
                         "/v1/contribute/video/update", json_body=payload
                     )
                 con = (data or {}).get("contribute") or {}
-                return f"更新成功: 投稿ID {con.get('id', contribute_id)}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}"
-            if action == "delete":
-                if type != "article":
-                    return "错误: v0.1 仅支持删除文章投稿（视频投稿请在网页端处理）"
-                if not contribute_id:
-                    return "错误: delete 需提供 contribute_id"
-                await client.post(
-                    "/v1/contribute/article/delete",
-                    json_body={"contribute_id": contribute_id},
-                )
-                return f"已删除投稿 {contribute_id}"
-            return "错误: action 仅支持 list / update / delete"
+                st = con.get("status")
+                st_text = _STATUS_TEXT.get(st) if st is not None else "已提交"
+                parts_note = f"（{len(videos)} 分P）" if type == "video" and isinstance(videos, list) else ""
+                return f"更新成功: 投稿ID {con.get('id', contribute_id)}，状态: {st_text}{parts_note}"
+            return "错误: action 仅支持 list / get / update（删除请用 mfuns_delete）"
         except Exception as e:
             return _fmt_err(e)
 

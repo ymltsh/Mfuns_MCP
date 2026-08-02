@@ -15,8 +15,7 @@
 | 工具 | 说明 |
 | ---- | ---- |
 | `mfuns_browse` | 浏览内容流：`recommend` 推荐 / `hot` 热门 / `feed` 全站动态 / `category` 分类帖子 / `latest` 最新聚合时间线（动态+视频+文章，LLM 友好 Markdown，来自自建服务 mfuns.wgen.top，支持 `content_type` 过滤） |
-| `mfuns_read_thread` | 读取帖子详情与评论区（含二级回复、图片解析、评论 ID） |
-| `mfuns_read_video` | 读取视频详情与评论区（分P、时长、弹幕计数） |
+| `mfuns_read` | 读取内容详情与评论区（帖子/视频/动态，含二级回复、图片解析、评论 ID） |
 | `mfuns_search` | 搜索内容（文章/视频）或用户 |
 | `mfuns_get_user` | 用户资料（互动前判断新人/老用户） |
 
@@ -29,7 +28,7 @@
 | `mfuns_create_feed` | 发布动态 |
 | `mfuns_react` | 点赞 / 取消 / 点踩（文章、视频、评论、动态） |
 | `mfuns_favorite` | 收藏 / 取消收藏 / 查询收藏状态 |
-| `mfuns_delete` | 删除动态 / 评论（仅本人内容） |
+| `mfuns_delete` | 删除动态 / 评论 / 文章投稿（仅本人内容） |
 | `mfuns_messages` | 私信会话列表 / 聊天记录 |
 
 ### Account 账号
@@ -43,8 +42,9 @@
 
 | 工具 | 说明 |
 | ---- | ---- |
-| `mfuns_publish_video` | 视频投稿 |
-| `mfuns_manage_submission` | 投稿管理：列表 / 更新 / 删除（`draft=true` 保持草稿状态） |
+| `mfuns_publish_video_upload` | 本地上传视频投稿（阿里云 VOD 全流程，支持分P） |
+| `mfuns_publish_video_link` | 外链视频投稿（视频直链 URL，如复活失效的 B 站外链，支持分P） |
+| `mfuns_manage_submission` | 投稿管理：列表 / 详情 / 更新（文章+视频，分P增改）/ 删除（`draft=true` 保持草稿状态） |
 
 ### System 系统
 
@@ -179,7 +179,8 @@ mfuns_mcp/
 
 | 限制 | 说明 |
 | ---- | ---- |
-| 视频投稿仅支持 | `type=link` 直链 URL，不含本地上传（阿里云 VOD 上传流程未实现） |
+| 待审核视频不可编辑 | `video/update` 对待审核稿件返回"系统繁忙"（服务端锁定），发布后可更新 |
+| 视频投稿删除 | API 无视频删除接口，需网页端处理 |
 | 评论点赞接口 | API 实测 `type=4`（文档标注的 3 已废弃）；type=3 返回 404 |
 | 收藏取消需 list_id | 收藏夹枚举未暴露为工具，`remove` 需提供 list_id |
 | 官方全站动态流为空 | `/v1/feeds/list` 对该账号无可展示内容，动态流建议用 `latest` 模式 |
