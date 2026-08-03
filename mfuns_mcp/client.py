@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import email.utils
-import hashlib
-import hmac
-import json
 import logging
+import mimetypes
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -216,6 +214,7 @@ class MfunsClient:
         auth: bool = True,
         retry: bool = True,
         source: str | None = None,
+        files: dict | None = None,
     ) -> Any:
         """发送请求并解包统一信封（code==1 返回 data），始终使用当前账号身份。
 
@@ -237,6 +236,7 @@ class MfunsClient:
             params=params,
             json=json_body,
             data=form,
+            files=files,
             headers=self._headers(source),
         )
         try:
@@ -249,14 +249,14 @@ class MfunsClient:
                 if self._token:
                     logger.info("API KEY 无效，回退用户 token")
                     return await self.request(
-                        method, path, params, json_body, form, auth, retry=False, source="token"
+                        method, path, params, json_body, form, auth, retry=False, source="token", files=files
                     )
                 raise MfunsError(401, f"账号 {self._account_id} 的 API KEY 无效或已过期")
             logger.info("token 失效或需登录，重新登录")
             async with self._login_lock:
                 await self.login()
             return await self.request(
-                method, path, params, json_body, form, auth, retry=False, source="token"
+                method, path, params, json_body, form, auth, retry=False, source="token", files=files
             )
         if code != 1:
             raise MfunsError(code, body.get("msg") or "请求失败")
@@ -266,9 +266,9 @@ class MfunsClient:
         return await self.request("GET", path, params=params)
 
     async def post(
-        self, path: str, json_body: dict | None = None, form: dict | None = None
+        self, path: str, json_body: dict | None = None, form: dict | None = None, files: dict | None = None
     ) -> Any:
-        return await self.request("POST", path, json_body=json_body, form=form)
+        return await self.request("POST", path, json_body=json_body, form=form, files=files)
 
     async def get_text(self, url: str, params: dict | None = None) -> str:
         """获取第三方服务的纯文本响应（如 mfuns.wgen.top，无 Mfuns 信封、无鉴权）。"""
@@ -310,7 +310,7 @@ class MfunsClient:
         return int(area_id)
 
     async def video_upload_auth(self, file_name: str, file_size: int) -> dict:
-        """获取阿里云 VOD 上传凭证。"""
+        """获取阿里云 VOD 上传凭证（UploadAuth/UploadAddress/VideoId）。"""
         data = await self.post(
             "/v1/contribute/video/get_upload_auth",
             json_body={"file_name": file_name, "file_size": file_size},
@@ -319,10 +319,23 @@ class MfunsClient:
             raise MfunsError(-1, "未获取到上传凭证")
         return data
 
-    async def video_upload_complete(self, video_id: str, retries: int = 5, delay: float = 3.0) -> dict:
-        """通知视频上传完成；服务端异步校验文件，失败自动重试（最终一致性）。"""
+    async def video_update_upload_auth(self, video_id: str) -> dict:
+        """刷新已有 VOD 记录的 OSS 上传凭证（断点续传恢复用，同一记录 objectKey 不变）。"""
+        data = await self.post(
+            "/v1/contribute/video/update_upload_auth",
+            json_body={"videoId": video_id},
+        )
+        if not isinstance(data, dict) or not data.get("VideoId"):
+            raise MfunsError(-1, "刷新上传凭证失败")
+        return data
+
+    async def video_upload_complete(self, video_id: str, retries: int = 12, delay: float = 5.0) -> dict:
+        """通知视频上传完成；VOD 服务端异步校验（OSS 传完到可识别有数秒延迟）。
+
+        实测：立即调用会返回"视频上传未完成"，按该提示重试；其它错误直接抛出。
+        """
         last_err: MfunsError | None = None
-        for _ in range(retries):
+        for i in range(retries):
             try:
                 data = await self.post(
                     "/v1/contribute/video/upload_complete",
@@ -330,8 +343,10 @@ class MfunsClient:
                 )
             except MfunsError as e:
                 last_err = e
+                if "未完成" not in e.msg or i == retries - 1:
+                    raise
             else:
-                if isinstance(data, dict) and data.get("status") == 1:
+                if isinstance(data, dict) and (data.get("status") == 1 or data.get("id")):
                     return data
                 last_err = MfunsError(
                     0, f"上传确认异常 status={data.get('status') if isinstance(data, dict) else data}"
@@ -339,36 +354,20 @@ class MfunsClient:
             await asyncio.sleep(delay)
         raise MfunsError(0, f"视频上传完成确认失败（{retries} 次重试后仍未确认: {last_err}）")
 
-
-def oss_put(addr_b64: str, auth_b64: str, file_obj, content_type: str = "application/octet-stream") -> None:
-    """将文件直接 PUT 到阿里云 OSS（VOD 上传地址），纯标准库签名，无 SDK 依赖。"""
-    addr = json.loads(base64.b64decode(addr_b64))
-    auth = json.loads(base64.b64decode(auth_b64))
-    endpoint = (addr.get("Endpoint") or addr.get("endpoint") or "").replace("https://", "").replace("http://", "")
-    bucket = addr.get("Bucket") or addr.get("bucket")
-    key = addr.get("FileName") or addr.get("fileName") or addr.get("objectKey")
-    if not (endpoint and bucket and key):
-        raise MfunsError(-1, "上传地址解析失败")
-    date = email.utils.formatdate(usegmt=True)
-    string_to_sign = (
-        f"PUT\n\n{content_type}\n{date}\n"
-        f"x-oss-security-token:{auth['SecurityToken']}\n/{bucket}/{key}"
-    )
-    signature = base64.b64encode(
-        hmac.new(
-            auth["AccessKeySecret"].encode(), string_to_sign.encode(), hashlib.sha1
-        ).digest()
-    ).decode()
-    headers = {
-        "Date": date,
-        "Content-Type": content_type,
-        "x-oss-security-token": auth["SecurityToken"],
-        "Authorization": f"OSS {auth['AccessKeyId']}:{signature}",
-    }
-    url = f"https://{bucket}.{endpoint}/{key}"
-    resp = httpx.put(url, content=file_obj, headers=headers, timeout=600.0)
-    if resp.status_code != 200:
-        raise MfunsError(-1, f"OSS 上传失败 HTTP {resp.status_code}: {resp.text[:200]}")
+    async def upload_image(self, file_path: str) -> dict:
+        """上传本地图片（封面用）；返回平台媒体信息，file.file_path 即 cover 可用相对路径。"""
+        p = Path(file_path)
+        if not p.is_file():
+            raise MfunsError(-1, f"图片不存在: {file_path}")
+        mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        with p.open("rb") as f:
+            data = await self.post(
+                "/v1/media/upload_image",
+                files={"file": (p.name, f, mime)},
+            )
+        if not isinstance(data, dict):
+            raise MfunsError(-1, f"图片上传响应异常: {data}")
+        return data
 
 
 # ---- 独立凭证校验（不依赖当前账号上下文，用于 mfuns_account_add）----

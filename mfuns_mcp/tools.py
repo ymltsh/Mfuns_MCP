@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -12,8 +13,9 @@ from mcp.server import MCPServer
 
 from . import config
 from .activity import activity, read_activity, set_account_resolver
-from .client import MfunsClient, MfunsError, api_identity, api_login, oss_put
+from .client import MfunsClient, MfunsError, api_identity, api_login
 from .format import author_name, html_to_text, quill_to_text, text_to_quill, ts_to_str
+from .upload import TASK_MANAGER, run_publish_task
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,13 @@ def _target_submission(kw: dict) -> dict:
     target: dict = {"type": kw.get("type") or "article"}
     if kw.get("contribute_id"):
         target["id"] = kw["contribute_id"]
+    return target
+
+
+def _target_upload_task(kw: dict) -> dict:
+    target: dict = {"type": "upload_task"}
+    if kw.get("task_id"):
+        target["id"] = kw["task_id"]
     return target
 
 
@@ -848,61 +857,95 @@ def register_tools(mcp: MCPServer) -> None:
         copyright: int = 0,
         tags: list[str] | None = None,
         extra_files: list[str] | None = None,
+        async_mode: bool | None = None,
     ) -> str:
-        """本地上传视频并投稿（阿里云 VOD 全流程，支持分P：extra_files 为 P2 起的本地文件）。
+        """本地上传视频并投稿（阿里云 VOD 断点续传，支持分P：extra_files 为 P2 起的本地文件）。
+
+        支持后台任务模式：创建后立即返回 task_id 与任务摘要，用 mfuns_upload_task(task_id=...) 查询进度；
+        多分P 并行上传，全部完成并校验后才自动投稿，避免长上传导致发布超时失败。
 
         Args:
             file_path: 本地视频文件路径（P1，支持 mp4/mov/mkv/flv/avi/wmv/webm/mpeg4/ts/mpg/rm/rmvb/m4v）
             title: 标题（最长 30 字）
             content: 简介（纯文本）
             category_id: 分类 ID（须为叶子分区；传父级分区会自动落到其第一个叶子子分区，缺省默认 1 动画>MMD.3D 请显式指定）
-            cover: 封面图 https 外链（视频投稿必填）
+            cover: 封面：https 外链或本地图片路径（本地图自动上传为 /static/xxx），缺省使用平台默认封面
             copyright: 版权，0=其他（默认，适合转载），1=转载，2=原创
             tags: 标签列表，最多 10 个
             extra_files: 额外分P 的本地文件路径列表（P2、P3…）
+            async_mode: None=自动（多文件时后台异步）, True=强制后台任务, False=强制同步（单文件默认同步）
         """
         try:
             paths = [Path(file_path)] + [Path(p) for p in (extra_files or [])]
-            if not cover:
-                return "错误: 视频投稿需提供封面图 https 外链（cover 参数）"
             for p in paths:
                 if not p.is_file():
                     return f"错误: 文件不存在 {p}"
                 if p.stat().st_size <= 0:
                     return f"错误: 文件为空 {p}"
-            videos: list[dict] = []
-            for i, p in enumerate(paths, start=1):
-                auth = await client.video_upload_auth(p.name, p.stat().st_size)
-                with p.open("rb") as f:
-                    oss_put(auth.get("UploadAddress", ""), auth.get("UploadAuth", ""), f)
-                record = await client.video_upload_complete(auth["VideoId"])
-                direct_id = record.get("id")
-                if not direct_id:
-                    return f"错误: 分P{i} 上传完成记录缺少视频库 ID"
-                videos.append(
-                    # type=direct 的 content 需为视频库记录的数字 ID（VOD 字符串 ID 会报"视频不存在"）
-                    {"type": "direct", "content": str(direct_id), "title": title if i == 1 else f"P{i}"}
-                )
             cid, note = await _resolve_category(client, category_id)
-            payload: dict = {
-                "cid": cid,
-                "title": title,
-                "content": text_to_quill(content or ""),
-                "video": json.dumps(videos, ensure_ascii=False),
-                "copyright": copyright,
-            }
-            if tags:
-                payload["tags"] = ",".join(tags[:10])
-            if cover:
-                payload["cover"] = cover
-            data = await client.post("/v1/contribute/video/create", json_body=payload)
-            con = (data or {}).get("contribute") or {}
-            msg = f"视频上传投稿成功: 投稿ID {con.get('id', '?')}，状态: {_STATUS_TEXT.get(con.get('status'), con.get('status'))}（{len(videos)} 分P）"
-            if note:
-                msg += f"\n提示: {note}"
-            return msg
+            background = async_mode if async_mode is not None else len(paths) > 1
+            task = TASK_MANAGER.create(
+                client.account_id,
+                title,
+                [p.name for p in paths],
+                [p.stat().st_size for p in paths],
+            )
+            task.files = [str(p) for p in paths]
+            task.content = content
+            task.cover = cover
+            task.copyright_ = copyright
+            task.tags = tags or []
+            task.cid = cid
+            task.note = note or ""
+            task.persist()
+            handle = asyncio.create_task(run_publish_task(client, task))
+            TASK_MANAGER.track(task.task_id, handle)
+            if background:
+                tip = "后台任务已创建，可用 mfuns_upload_task(task_id=...) 查询进度"
+                if task.note:
+                    tip += f"（{task.note}）"
+                return task.describe() + f"\n提示: {tip}"
+            await handle
+            if task.status == "done":
+                msg = f"视频上传投稿成功: 投稿ID {task.contribute_id}，状态: {_STATUS_TEXT.get(task.contribute_status, task.contribute_status)}（{len(paths)} 分P）"
+                if task.note:
+                    msg += f"\n提示: {task.note}"
+                return msg
+            return f"错误: {task.error or '未知错误'}"
         except Exception as e:
             return _fmt_err(e)
+
+    @mcp.tool()
+    @activity(lambda kw: kw.get("action") or "status", _target_upload_task)
+    async def mfuns_upload_task(action: str = "status", task_id: str | None = None) -> str:
+        """查询后台视频上传任务进度（多文件异步投稿用）。
+
+        服务重启后首次调用会自动恢复磁盘上未完成的任务并继续上传（断点续传）。
+
+        Args:
+            action: 操作，可选: status=任务状态（默认）, list=任务列表
+            task_id: 任务 ID（action=status 时必填）
+        """
+        restored = await TASK_MANAGER.ensure_resumed()
+        if action == "list":
+            tasks = TASK_MANAGER.list()
+            if not tasks:
+                return "暂无上传任务"
+            lines = [f"上传任务列表（最近 {len(tasks)} 个）:"]
+            if restored:
+                lines.append(f"提示: 已恢复 {restored} 个中断任务并继续上传")
+            for t in tasks:
+                done = t.uploaded_count()
+                lines.append(
+                    f"- {t.task_id} [{t.status}] {t.title}（{done}/{len(t.parts)} 分P）"
+                )
+            return "\n".join(lines)
+        if not task_id:
+            return "错误: status 需提供 task_id（可用 action=list 查看任务）"
+        task = TASK_MANAGER.get(task_id)
+        if not task:
+            return f"错误: 任务不存在或已过期: {task_id}"
+        return task.describe()
 
     @mcp.tool()
     @activity("publish_video_link", lambda kw: {"type": "video"})
