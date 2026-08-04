@@ -519,9 +519,11 @@ async def run_publish_task(client: MfunsClient, task: TaskInfo) -> None:
         cover_url = await _cover_url(client, task.cover)
         videos: list[dict] = []
         for i, part in enumerate(task.parts):
+            # 实测：content 必须是整数（视频库记录 ID，官方网页端即提交数字），
+            # 字符串会被审核系统判定"视频或信息失效"驳回
             item: dict = {
                 "type": "direct",
-                "content": str(part.mfuns_id),
+                "content": part.mfuns_id,
                 # P1 用投稿标题，后续分P 用 P2/P3…
                 "title": task.title if i == 0 else f"P{i + 1}",
             }

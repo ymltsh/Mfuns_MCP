@@ -133,6 +133,14 @@ def _fmt_err(e: Exception) -> str:
     return f"错误: {e}"
 
 
+def _direct_id(v: Any) -> Any:
+    """VOD 视频库记录 ID 转整数（官方网页端提交数字 id；字符串会被审核判定"视频或信息失效"驳回）。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return v
+
+
 def _ensure_list(data: Any) -> list:
     if isinstance(data, list):
         return data
@@ -1020,6 +1028,7 @@ def register_tools(mcp: MCPServer) -> None:
         video_url: str | None = None,
         video_id: str | None = None,
         parts: list[str] | None = None,
+        parts_meta: list[dict] | None = None,
         copyright: int | None = None,
     ) -> str:
         """管理我的投稿：查看列表/详情 / 更新投稿（文章或视频，支持分P编辑）。
@@ -1038,9 +1047,10 @@ def register_tools(mcp: MCPServer) -> None:
             cover: 新封面（update 可选）
             draft: 更新后是否保持草稿（文章 update 可选，不传则进入审核队列；草稿稿件更新建议传 true）
             video_url: P1 外链直链 URL（视频 update 时提供 video_url 或 video_id 之一，作为 P1）
-            video_id: P1 本地上传 VOD 库 ID（视频 update 时提供 video_url 或 video_id 之一，作为 P1）
+            video_id: P1 本地上传 VOD 库记录 ID（视频 update 时提供 video_url 或 video_id 之一，作为 P1；数字 id 必须为整数语义，工具自动转整数）
             parts: 分P 列表（P2 起）；与 P1 同类型（video_url 时为外链 URL，video_id 时为 VOD 库 ID）；
                    仅提供 parts 且未提供 P1 时，自动追加到现有稿件末尾（作为 link 外链分P）
+            parts_meta: 分P meta 列表（可选，与全部分P 一一对应，第 1 项为 P1 的 meta）；仅 video_id 本地上传类型有意义，供编辑页显示大小/时长
             copyright: 新版权（update 可选，文章默认 2，视频默认 0）
         """
         try:
@@ -1120,14 +1130,21 @@ def register_tools(mcp: MCPServer) -> None:
                         videos: list[dict] = [
                             {
                                 "type": "direct" if video_id else "link",
-                                "content": video_id or video_url,
+                                "content": _direct_id(video_id) if video_id else video_url,
                                 "title": title,
                             }
                         ]
                         for i, p in enumerate(parts or [], start=2):
                             videos.append(
-                                {"type": "direct" if video_id else "link", "content": p, "title": f"P{i}"}
+                                {
+                                    "type": "direct" if video_id else "link",
+                                    "content": _direct_id(p) if video_id else p,
+                                    "title": f"P{i}",
+                                }
                             )
+                        for j, item in enumerate(videos):
+                            if parts_meta and j < len(parts_meta) and parts_meta[j]:
+                                item["meta"] = parts_meta[j]
                     else:
                         # 仅 parts：读取现有分P，追加为 link 外链分P
                         cur = await client.get(
