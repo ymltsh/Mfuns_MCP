@@ -41,6 +41,7 @@ _TASK_STATUS = {
     "publishing": "投稿中",
     "done": "已完成",
     "failed": "失败",
+    "cancelled": "已取消",
 }
 _PART_STATUS = {
     "pending": "排队中",
@@ -194,6 +195,7 @@ class TaskInfo:
     task_id: str
     account_id: str
     title: str
+    mode: str = "create"  # create=新建投稿 / append=追加分P到现有投稿
     status: str = "pending"  # pending / uploading / publishing / done / failed
     cid: int | None = None
     note: str = ""
@@ -221,6 +223,7 @@ class TaskInfo:
             "task_id": self.task_id,
             "account_id": self.account_id,
             "title": self.title,
+            "mode": self.mode,
             "status": self.status,
             "cid": self.cid,
             "note": self.note,
@@ -243,6 +246,7 @@ class TaskInfo:
             task_id=d.get("task_id", ""),
             account_id=d.get("account_id", ""),
             title=d.get("title", ""),
+            mode=d.get("mode", "create"),
             status=d.get("status", "pending"),
             cid=d.get("cid"),
             note=d.get("note") or "",
@@ -296,8 +300,11 @@ class TaskInfo:
                 lines.append(f"  P{i} {p.name}: {st}（{p.error[:120]}）")
             else:
                 lines.append(f"  P{i} {p.name}: {st}")
-        if self.status == "done" and self.contribute_id:
-            lines.append(f"投稿成功: 投稿ID {self.contribute_id}")
+        if self.status == "done":
+            if self.mode == "append" and self.contribute_id:
+                lines.append(f"已追加 {len(self.parts)} 个分P 到投稿 {self.contribute_id}")
+            else:
+                lines.append(f"投稿成功: 投稿ID {self.contribute_id}")
         elif self.status == "failed":
             lines.append(f"失败原因: {self.error[:300]}")
         if self.note:
@@ -346,6 +353,20 @@ class TaskManager:
         self._handles[task_id] = handle
         handle.add_done_callback(lambda _: self._handles.pop(task_id, None))
 
+    def cancel(self, task_id: str) -> TaskInfo | None:
+        """取消运行中的任务：中止后续分P 上传与投稿，标记 cancelled。
+
+        当前正在 OSS 上传的分P 片段无法中断（线程内进行），但不会继续排队与投稿；
+        已上传的孤儿 VOD 记录平台侧约 10-20 分钟自动失效。
+        """
+        task = self._tasks.get(task_id)
+        handle = self._handles.get(task_id)
+        if task is None or handle is None:
+            return None
+        if not handle.done():
+            handle.cancel()
+        return task
+
     async def ensure_resumed(self) -> int:
         """扫描磁盘恢复未完成任务并重启后台执行，返回恢复的任务数。
 
@@ -374,7 +395,8 @@ class TaskManager:
                 continue
             restored += 1
             client = MfunsClient(task.account_id)
-            handle = asyncio.create_task(run_publish_task(client, task))
+            runner = run_append_task if task.mode == "append" else run_publish_task
+            handle = asyncio.create_task(runner(client, task))
             self.track(task.task_id, handle)
         if restored:
             logger.info("已恢复 %d 个未完成上传任务", restored)
@@ -466,17 +488,27 @@ async def _cover_url(client: MfunsClient, cover: str) -> str:
 async def _log_completion(task: TaskInfo) -> None:
     try:
         from .activity import write_activity
+        tool = "manage_submission" if task.mode == "append" else "publish_video_upload"
         if task.status == "done":
+            action = "append_done" if task.mode == "append" else "publish_done"
             await write_activity(
-                "publish_video_upload", "publish_done",
+                tool, action,
                 target={"type": "video", "id": task.contribute_id},
                 params={"task_id": task.task_id, "title": task.title},
                 result={"status": "success"},
                 account_id=task.account_id,
             )
-        else:
+        elif task.status == "cancelled":
             await write_activity(
-                "publish_video_upload", "publish_failed",
+                tool, "task_cancelled",
+                params={"task_id": task.task_id, "title": task.title},
+                result={"status": "cancelled"},
+                account_id=task.account_id,
+            )
+        else:
+            action = "append_failed" if task.mode == "append" else "publish_failed"
+            await write_activity(
+                tool, action,
                 params={"task_id": task.task_id, "title": task.title},
                 result={"status": "error", "message": (task.error or "")[:200]},
                 account_id=task.account_id,
@@ -548,11 +580,100 @@ async def run_publish_task(client: MfunsClient, task: TaskInfo) -> None:
         task.contribute_status = con.get("status")
         task.status = "done"
         task.persist()
+    except asyncio.CancelledError:
+        task.status = "cancelled"
+        task.error = ""
+        task.persist()
+        raise
     except Exception as e:
         task.status = "failed"
         task.error = str(e)
         task.persist()
         logger.warning("上传任务 %s 失败: %s", task.task_id, e)
+    finally:
+        task.updated_at = time.time()
+        task.persist()
+        await _log_completion(task)
+
+
+async def run_append_task(client: MfunsClient, task: TaskInfo) -> None:
+    """追加分P 管线（mode=append）：并行上传本地文件 -> 读取现有分P -> 追加后 video/update。
+
+    与 run_publish_task 同构：异常收敛为 task failed/cancelled，不向上抛出。
+    """
+    files = [Path(f) for f in task.files]
+    checkpoint_dir = str(task.dir)
+    try:
+        if not files:
+            raise VodUploadError(-1, "任务未配置视频文件列表")
+        for p in files:
+            if not p.is_file():
+                raise VodUploadError(-1, f"文件不存在: {p}")
+
+        task.status = "uploading"
+        task.persist()
+        sem = asyncio.Semaphore(min(UPLOAD_CONCURRENCY, len(files)))
+
+        async def _worker(idx: int) -> None:
+            async with sem:
+                await _upload_part(client, task, idx, files[idx], checkpoint_dir)
+
+        results = await asyncio.gather(
+            *(_worker(i) for i in range(len(files))), return_exceptions=True
+        )
+        errors = [r for r in results if isinstance(r, Exception)]
+        if errors:
+            raise errors[0]
+
+        task.status = "publishing"
+        task.persist()
+
+        cur = await client.get("/v1/contribute/get", contribute_id=task.contribute_id)
+        cur_con = (cur or {}).get("contribute") or {}
+        cur_videos = cur_con.get("videos") or []
+        videos = [dict(v) for v in cur_videos if isinstance(v, dict)]
+        base = len(videos)
+        for i, part in enumerate(task.parts, start=base + 1):
+            item: dict = {
+                "type": "direct",
+                "content": part.mfuns_id,
+                "title": f"P{i}",
+            }
+            if part.meta:
+                item["meta"] = part.meta
+            videos.append(item)
+
+        # 封面：未指定时沿用现有封面（防止默认封面覆盖原稿封面），仍无则用平台默认
+        if task.cover:
+            cover_url = await _cover_url(client, task.cover)
+        else:
+            cover_url = cur_con.get("cover") or DEFAULT_COVER
+
+        payload: dict = {
+            "contribute_id": task.contribute_id,
+            "cid": task.cid,
+            "title": task.title,
+            "content": text_to_quill(task.content),
+            "cover": cover_url,
+            "video": json.dumps(videos, ensure_ascii=False),
+            "copyright": task.copyright_,
+        }
+        if task.tags:
+            payload["tags"] = ",".join(task.tags[:10])
+
+        await client.post("/v1/contribute/video/update", json_body=payload)
+        task.status = "done"
+        task.persist()
+    except asyncio.CancelledError:
+        task.status = "cancelled"
+        task.error = ""
+        task.persist()
+        raise
+    except Exception as e:
+        task.status = "failed"
+        task.error = str(e)
+        task.persist()
+        logger.warning("追加任务 %s 失败: %s", task.task_id, e)
     finally:
         task.updated_at = time.time()
         task.persist()

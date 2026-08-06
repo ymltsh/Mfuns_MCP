@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from . import config
 from .activity import activity, read_activity, set_account_resolver
 from .client import MfunsClient, MfunsError, api_identity, api_login
 from .format import author_name, html_to_text, quill_to_text, text_to_quill, ts_to_str
-from .upload import TASK_MANAGER, run_publish_task
+from .upload import TASK_MANAGER, run_append_task, run_publish_task
 
 logger = logging.getLogger(__name__)
 
@@ -616,10 +617,10 @@ def register_tools(mcp: MCPServer) -> None:
         lambda kw: {"type": kw.get("target_type"), "id": kw.get("target_id")},
     )
     async def mfuns_delete(target_type: str, target_id: int) -> str:
-        """删除内容（动态/评论/文章投稿，仅限本人内容）。
+        """删除内容（动态/评论/文章/视频投稿，仅限本人内容）。
 
         Args:
-            target_type: 删除对象，可选: feed=动态, comment=评论, article=文章投稿
+            target_type: 删除对象，可选: feed=动态, comment=评论, article=文章投稿, video=视频投稿
             target_id: 对象 ID（动态 ID / 评论 ID / 投稿 ID）
         """
         try:
@@ -637,7 +638,14 @@ def register_tools(mcp: MCPServer) -> None:
                     json_body={"contribute_id": target_id},
                 )
                 return f"已删除文章投稿 {target_id}"
-            return "错误: target_type 仅支持 feed / comment / article"
+            if target_type == "video":
+                # 实测接口存在（官方文档未公开）；api_key 白名单外走 token
+                await client.post(
+                    "/v1/contribute/video/delete",
+                    json_body={"contribute_id": target_id},
+                )
+                return f"已删除视频投稿 {target_id}"
+            return "错误: target_type 仅支持 feed / comment / article / video"
         except Exception as e:
             return _fmt_err(e)
 
@@ -926,13 +934,13 @@ def register_tools(mcp: MCPServer) -> None:
     @mcp.tool()
     @activity(lambda kw: kw.get("action") or "status", _target_upload_task)
     async def mfuns_upload_task(action: str = "status", task_id: str | None = None) -> str:
-        """查询后台视频上传任务进度（多文件异步投稿用）。
+        """查询后台视频上传任务进度 / 取消任务（多文件异步投稿用）。
 
         服务重启后首次调用会自动恢复磁盘上未完成的任务并继续上传（断点续传）。
 
         Args:
-            action: 操作，可选: status=任务状态（默认）, list=任务列表
-            task_id: 任务 ID（action=status 时必填）
+            action: 操作，可选: status=任务状态（默认）, list=任务列表, cancel=取消任务
+            task_id: 任务 ID（action=status/cancel 时必填）
         """
         restored = await TASK_MANAGER.ensure_resumed()
         if action == "list":
@@ -949,10 +957,21 @@ def register_tools(mcp: MCPServer) -> None:
                 )
             return "\n".join(lines)
         if not task_id:
-            return "错误: status 需提供 task_id（可用 action=list 查看任务）"
+            return "错误: action=status/cancel 需提供 task_id（可用 action=list 查看任务）"
         task = TASK_MANAGER.get(task_id)
         if not task:
             return f"错误: 任务不存在或已过期: {task_id}"
+        if action == "cancel":
+            if task.status in ("done", "failed", "cancelled"):
+                return f"任务 {task_id} 已处于终态（{task.status}），无需取消"
+            TASK_MANAGER.cancel(task_id)
+            return (
+                f"已请求取消任务 {task_id}（{task.title}）\n"
+                "说明: 上传中的分P 会在当前片段结束后停止，不会继续排队与投稿；"
+                "已上传的孤儿视频记录平台侧约 10-20 分钟自动失效"
+            )
+        if action != "status":
+            return f"错误: action 仅支持 status / list / cancel"
         return task.describe()
 
     @mcp.tool()
@@ -1029,6 +1048,7 @@ def register_tools(mcp: MCPServer) -> None:
         video_id: str | None = None,
         parts: list[str] | None = None,
         parts_meta: list[dict] | None = None,
+        append_files: list[str] | None = None,
         copyright: int | None = None,
     ) -> str:
         """管理我的投稿：查看列表/详情 / 更新投稿（文章或视频，支持分P编辑）。
@@ -1051,6 +1071,7 @@ def register_tools(mcp: MCPServer) -> None:
             parts: 分P 列表（P2 起）；与 P1 同类型（video_url 时为外链 URL，video_id 时为 VOD 库 ID）；
                    仅提供 parts 且未提供 P1 时，自动追加到现有稿件末尾（作为 link 外链分P）
             parts_meta: 分P meta 列表（可选，与全部分P 一一对应，第 1 项为 P1 的 meta）；仅 video_id 本地上传类型有意义，供编辑页显示大小/时长
+            append_files: 追加本地上传分P 的本地文件路径列表（视频 update 可选）；后台任务自动上传到 VOD 视频库并追加到现有稿件末尾（并行上传，用 mfuns_upload_task 查询进度），与 video_url/video_id/parts 互斥
             copyright: 新版权（update 可选，文章默认 2，视频默认 0）
         """
         try:
@@ -1122,11 +1143,42 @@ def register_tools(mcp: MCPServer) -> None:
                 else:
                     if video_url and video_id:
                         return "错误: video_url 与 video_id 不能同时提供（P1 只能选外链或本地上传）"
-                    if not video_url and not video_id and not parts:
-                        return "错误: 视频 update 需提供 video_url/video_id（P1）或 parts（追加分P）"
-                    if not cover:
+                    if not video_url and not video_id and not parts and not append_files:
+                        return "错误: 视频 update 需提供 video_url/video_id（P1）、parts 或 append_files（追加分P）"
+                    if not cover and not append_files:
                         return "错误: 视频 update 需提供 cover 封面图 https 外链"
-                    if video_url or video_id:
+                    if append_files and (video_url or video_id or parts):
+                        return "错误: append_files 与 video_url/video_id/parts 互斥（追加本地上传分P 请单独使用 append_files）"
+                    if append_files:
+                        # 本地上传追加分P：创建后台任务（并行上传 -> 读取现有分P -> 追加 -> video/update）
+                        paths = [Path(f) for f in append_files]
+                        for p in paths:
+                            if not p.is_file():
+                                return f"错误: 文件不存在 {p}"
+                            if p.stat().st_size <= 0:
+                                return f"错误: 文件为空 {p}"
+                        task = TASK_MANAGER.create(
+                            client.account_id,
+                            title,
+                            [p.name for p in paths],
+                            [p.stat().st_size for p in paths],
+                        )
+                        task.mode = "append"
+                        task.contribute_id = contribute_id
+                        task.files = [str(p) for p in paths]
+                        task.content = content
+                        task.cover = cover or ""
+                        task.copyright_ = copyright if copyright is not None else (2 if type == "article" else 0)
+                        task.tags = tags or []
+                        task.cid = category_id
+                        task.persist()
+                        handle = asyncio.create_task(run_append_task(client, task))
+                        TASK_MANAGER.track(task.task_id, handle)
+                        return (
+                            f"追加任务已创建: {task.task_id}（{len(paths)} 个本地分P 将上传并追加到投稿 {contribute_id}）\n"
+                            "用 mfuns_upload_task(task_id=...) 查询进度（上传在后台进行，不会阻塞本次调用）"
+                        )
+                    elif video_url or video_id:
                         videos: list[dict] = [
                             {
                                 "type": "direct" if video_id else "link",

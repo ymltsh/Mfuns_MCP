@@ -30,7 +30,7 @@
 | `mfuns_create_feed` | 发布动态（标签、图片） |
 | `mfuns_react` | 点赞 / 取消 / 点踩（文章、视频、评论、动态，type 映射已实测修正） |
 | `mfuns_favorite` | 收藏 / 取消收藏 / 查询收藏状态 |
-| `mfuns_delete` | 删除动态 / 评论 / 文章投稿（仅本人内容） |
+| `mfuns_delete` | 删除动态 / 评论 / 文章 / 视频投稿（仅本人内容） |
 | `mfuns_messages` | 私信：会话列表 / 聊天记录 / 发送（form+msg 实测可用） |
 
 ### Publishing 投稿
@@ -38,9 +38,9 @@
 | 工具 | 说明 |
 | ---- | ---- |
 | `mfuns_publish_video_upload` | 本地上传视频投稿（阿里云 VOD 断点续传，支持分P；可后台任务化：多P 并行上传 + `mfuns_upload_task` 查询进度；任务状态落盘，重启自动续传；本地封面自动上传，缺省用平台默认封面） |
-| `mfuns_upload_task` | 视频上传任务查询：`status` 任务详情（分P进度/投稿结果）/ `list` 任务列表 |
+| `mfuns_upload_task` | 视频上传任务查询/管理：`status` 任务详情（分P进度/投稿结果）/ `list` 任务列表 / `cancel` 取消任务 |
 | `mfuns_publish_video_link` | 外链视频投稿（视频直链 URL，如复活失效的 B 站外链，支持分P） |
-| `mfuns_manage_submission` | 投稿管理：列表 / 详情 / 更新（文章+视频，分P增改/追加，`draft=true` 保持草稿） |
+| `mfuns_manage_submission` | 投稿管理：列表 / 详情 / 更新（文章+视频，分P增改/追加，`append_files` 本地上传追加分P 走后台任务，`draft=true` 保持草稿） |
 
 ### Account 账号
 
@@ -224,7 +224,7 @@ mfuns_mcp/
 | 限制 | 说明 |
 | ---- | ---- |
 | 待审核视频不可编辑 | `video/update` 对待审核稿件返回"系统繁忙"（服务端锁定），发布后可更新 |
-| 视频投稿删除 | API 无视频删除接口，需网页端处理 |
+| 视频投稿删除 | `POST /v1/contribute/video/delete` 实测可用（接口未在官方文档公开），`mfuns_delete(target_type=video)` 已接入 |
 | 收藏取消需 list_id | 收藏夹枚举未暴露为工具，`remove` 需提供 list_id |
 | 官方全站动态流为空 | `/v1/feeds/list` 对该账号无可展示内容，动态流建议用 `latest` 模式 |
 | 私信空记录 | 早期探测产生的空消息无法删除（无删除接口） |
